@@ -21,3 +21,10 @@ from pynq import Overlay
 ol = Overlay('harris_kv260.bit')
 print(ol.axi_dma_0.register_map)
 "
+
+source /opt/xilinx/xrt/setup.sh
+sudo -E /usr/local/share/pynq-venv/bin/python3 -c "
+from pynq import Overlay
+ol = Overlay('harris_kv260.bit')
+print('OK:', list(ol.ip_dict.keys()))
+"
