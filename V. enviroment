@@ -28,3 +28,5 @@ from pynq import Overlay
 ol = Overlay('harris_kv260.bit')
 print('OK:', list(ol.ip_dict.keys()))
 "
+
+sed -n '400,450p' /usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py
