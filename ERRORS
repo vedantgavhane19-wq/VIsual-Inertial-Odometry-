@@ -1,0 +1,116 @@
+ERRORS
+(pynq-venv) root@kria:/home/ubuntu/harris_demo# which xclbinutil
+/usr/local/share/pynq-venv/bin/xclbinutil
+(pynq-venv) root@kria:/home/ubuntu/harris_demo# xclbinutil --version
+       XRT Build Version: 2.13.0
+    Build Version Branch: temp
+      Build Version Hash: f5505e402c2ca1ffe45eb6d3a9399b23a0dc8776
+ Build Version Hash Date: Fri, 15 Apr 2022 00:59:02 +0530
+      Build Version Date: Mon, 22 Aug 2022 15:35:28 -0700
+(pynq-venv) root@kria:/home/ubuntu/harris_demo# sed -n '400,450p' /usr/local/share/pynq-venv/lib/python3.10/site/packages/pynq/pl_server/embedded_device.py
+sed: can't read /usr/local/share/pynq-venv/lib/python3.10/site/packages/pynq/pl_server/embedded_device.py: No such file or directory
+(pynq-venv) root@kria:/home/ubuntu/harris_demo# sed -n '400,450p' /usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py
+                    "m_used": 1,
+                    "m_sizeKB": v["addr_range"] // 1024,
+                    "m_tag": f'MIG{len(topology["m_mem_data"])}',
+                    "m_base_address": v["phys_addr"],
+                }
+            )
+    topology["m_count"] = len(topology["m_mem_data"])
+    return {"mem_topology": topology}
+
+
+def _as_str(obj):
+    if type(obj) is bytes:
+        return obj.decode()
+    return obj
+
+
+def _create_xclbin(mem_dict):
+    """Create an XCLBIN file containing the specified memories"""
+    import json
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "metadata.xml").write_text(BLANK_METADATA)
+        (td / "mem.json").write_text(json.dumps(_ip_to_topology(mem_dict)))
+        completion = subprocess.run(
+            [
+                "xclbinutil",
+                "--add-section=EMBEDDED_METADATA:RAW:metadata.xml",
+                "--add-section=MEM_TOPOLOGY:JSON:mem.json",
+                "--output",
+                "t.xclbin",
+                "--skip-bank-grouping",
+            ],
+            cwd=td,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if completion.returncode != 0:
+            raise RuntimeError("xclbinutil failed: " + _as_str(completion.stdout))
+        return (td / "t.xclbin").read_bytes()
+
+
+ZU_FPD_SLCR_REG = {
+    "C_MAXIGP0_DATA_WIDTH": {
+        "FPD_SLCR.AXI_FS.DW_SS0_SEL": {"addr": 0xFD615000, "field": [9, 8]}
+    },
+    "C_MAXIGP1_DATA_WIDTH": {
+        "FPD_SLCR.AXI_FS.DW_SS1_SEL": {"addr": 0xFD615000, "field": [11, 10]}
+    },
+(pynq-venv) root@kria:/home/ubuntu/harris_demo# sudo -E /usr/local/share/pynq-venv/bin/python3 -u -c "
+> import logging
+logging.basicConfig(level=logging.DEBUG)
+from pynq import Overlay
+ol = Overlay('harris_kv260.bit')
+print('OK')
+" 2>&1 | tee overlay_debug.log
+    "C_MAXIGP1_DATA_WIDTH": {
+        "FPD_SLCR.AXI_FS.DW_SS1_SEL": {"addr": 0xFD615000, "field": [11, 10]}
+    },
+DEBUG:asyncio:Using selector: EpollSelector
+DEBUG:graphviz._tools:deprecate positional args: graphviz.backend.piping.pipe(['renderer', 'formatter', 'neato_no_op', 'quiet'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.backend.rendering.render(['renderer', 'formatter', 'neato_no_op', 'quiet'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.backend.unflattening.unflatten(['stagger', 'fanout', 'chain', 'encoding'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.backend.viewing.view(['quiet'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.quoting.quote(['is_html_string', 'is_valid_id', 'dot_keywords', 'endswith_odd_number_of_backslashes', 'escape_unescaped_quotes'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.quoting.a_list(['kwargs', 'attributes'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.quoting.attr_list(['kwargs', 'attributes'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.dot.Dot.clear(['self', 'keep_attrs'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.dot.Dot.__iter__(['self', 'subgraph'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.dot.Dot.node(['label', '_attributes'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.dot.Dot.edge(['label', '_attributes'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.dot.Dot.attr(['kw', '_attributes'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.dot.Dot.subgraph(['graph', 'name', 'comment', 'graph_attr', 'node_attr', 'edge_attr', 'body'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.piping.Pipe._pipe_legacy(['format', 'renderer', 'formatter', 'neato_no_op', 'quiet'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.saving.Save.save(['filename', 'directory'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.rendering.Render.render(['filename', 'directory', 'view', 'cleanup', 'format', 'renderer', 'formatter', 'neato_no_op', 'quiet', 'quiet_view'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.rendering.Render.view(['filename', 'directory', 'cleanup', 'quiet', 'quiet_view'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.unflattening.Unflatten.unflatten(['self', 'stagger', 'fanout', 'chain'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.graphs.BaseGraph.__init__(['name', 'comment', 'filename', 'directory', 'format', 'engine', 'encoding', 'graph_attr', 'node_attr', 'edge_attr', 'body', 'strict'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.sources.Source.from_file(['filename', 'directory', 'format', 'engine', 'encoding', 'renderer', 'formatter'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.sources.Source.__init__(['source', 'filename', 'directory', 'format', 'engine', 'encoding'])
+DEBUG:graphviz._tools:deprecate positional args: graphviz.sources.Source.save(['filename', 'directory'])
+Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+  File "/usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/overlay.py", line 319, in __init__
+    self.device.set_bitfile_name(self.bitfile_name)
+  File "/usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/device.py", line 118, in set_bitfile_name
+    self.parser = self.get_bitfile_metadata(self.bitfile_name)
+  File "/usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py", line 690, in get_bitfile_metadata
+    parser = _get_bitstream_handler(bitfile_name).get_parser(partial=partial)
+  File "/usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py", line 259, in get_parser
+    xclbin_data = _create_xclbin(parser.mem_dict)
+  File "/usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py", line 441, in _create_xclbin
+    return (td / "t.xclbin").read_bytes()
+  File "/usr/lib/python3.10/pathlib.py", line 1126, in read_bytes
+    with self.open(mode='rb') as f:
+  File "/usr/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpyu344zr7/t.xclbin'
+C_MAXIGP1_DATA_WIDTH:: command not found
+FPD_SLCR.AXI_FS.DW_SS1_SEL:: command not found
+},: command not found
