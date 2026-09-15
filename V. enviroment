@@ -1,3 +1,4 @@
+Activate the PYNQ Environment in Root
 sudo -i
 source /etc/profile.d/pynq_venv.sh
 cd /home/ubuntu/harris_demo
@@ -6,4 +7,11 @@ from pynq import Overlay
 ol = Overlay('harris_kv260.bit')
 print('FPGA Programmed Successfully!')
 print('Detected IP blocks:', list(ol.ip_dict.keys()))
+"
+
+Inspect IP Register Map
+python3 -c "
+from pynq import Overlay
+ol = Overlay('harris_kv260.bit')
+print(ol.corner_harris_accel_0.register_map)
 "
