@@ -46,17 +46,3 @@ in_buf.freebuffer()
 out_buf.freebuffer()
 EOF
 python3 smoke_test.py
-
-
-# 1. Arm receive buffer first
-dma.recvchannel.transfer(out_buf)
-
-# 2. Start HLS IP core
-harris_ip.register_map.CTRL.AP_START = 1
-
-# 3. Stream input data
-dma.sendchannel.transfer(in_buf)
-
-# 4. Wait with a timeout
-dma.sendchannel.wait()
-dma.recvchannel.wait()
