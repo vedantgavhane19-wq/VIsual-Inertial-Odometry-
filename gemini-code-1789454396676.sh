@@ -28,13 +28,21 @@ np.copyto(in_buf, test_pattern)
 print("[INFO] Initiating DMA transfers...")
 start_time = time.time()
 
-# 5. Start HLS core and trigger bidirectional DMA
+# 5. Start HLS core and trigger bidirectional DMA (with debug tracing)
 harris_ip.register_map.CTRL.AP_START = 1
-dma.sendchannel.transfer(in_buf)
-dma.recvchannel.transfer(out_buf)
+print("[DEBUG] CTRL after start:", harris_ip.register_map.CTRL)
 
+dma.sendchannel.transfer(in_buf)
+print("[DEBUG] Send transfer issued")
 dma.sendchannel.wait()
+print("[DEBUG] Send done")
+
+dma.recvchannel.transfer(out_buf)
+print("[DEBUG] Recv transfer issued")
 dma.recvchannel.wait()
+print("[DEBUG] Recv done")
+
+print("[DEBUG] CTRL after transfers:", harris_ip.register_map.CTRL)
 
 elapsed_ms = (time.time() - start_time) * 1000.0
 corners_found = np.count_nonzero(out_buf == 255)
@@ -45,4 +53,4 @@ print(f"[INFO] Corner markers generated: {corners_found}")
 in_buf.freebuffer()
 out_buf.freebuffer()
 EOF
-python3 smoke_test.py
+sudo /usr/local/share/pynq-venv/bin/python3 smoke_test.py
