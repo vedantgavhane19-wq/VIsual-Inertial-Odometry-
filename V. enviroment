@@ -1,0 +1,9 @@
+sudo -i
+source /etc/profile.d/pynq_venv.sh
+cd /home/ubuntu/harris_demo
+python3 -c "
+from pynq import Overlay
+ol = Overlay('harris_kv260.bit')
+print('FPGA Programmed Successfully!')
+print('Detected IP blocks:', list(ol.ip_dict.keys()))
+"
