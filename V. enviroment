@@ -15,3 +15,9 @@ from pynq import Overlay
 ol = Overlay('harris_kv260.bit')
 print(ol.corner_harris_accel_0.register_map)
 "
+
+sudo /usr/local/share/pynq-venv/bin/python3 -c "
+from pynq import Overlay
+ol = Overlay('harris_kv260.bit')
+print(ol.axi_dma_0.register_map)
+"
