@@ -80,6 +80,15 @@ ZU_FPD_SLCR_REG = {
     "C_MAXIGP0_DATA_WIDTH": {
         "FPD_SLCR.AXI_FS.DW_SS0_SEL": {"addr": 0xFD615000, "field": [9, 8]}
     },
+
+
+sudo -E /usr/local/share/pynq-venv/bin/python3 -u -c "
+import logging
+logging.basicConfig(level=logging.DEBUG)
+from pynq import Overlay
+ol = Overlay('harris_kv260.bit')
+print('OK')
+" 2>&1 | tee overlay_debug.log
     "C_MAXIGP1_DATA_WIDTH": {
         "FPD_SLCR.AXI_FS.DW_SS1_SEL": {"addr": 0xFD615000, "field": [11, 10]}
     },
