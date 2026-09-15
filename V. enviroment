@@ -30,3 +30,57 @@ print('OK:', list(ol.ip_dict.keys()))
 "
 
 sed -n '400,450p' /usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py
+
+(pynq-venv) root@kria:/home/ubuntu/harris_demo# sed -n '400,450p' /usr/local/share/pynq-venv/lib/python3.10/site-packages/pynq/pl_server/embedded_device.py
+                    "m_used": 1,
+                    "m_sizeKB": v["addr_range"] // 1024,
+                    "m_tag": f'MIG{len(topology["m_mem_data"])}',
+                    "m_base_address": v["phys_addr"],
+                }
+            )
+    topology["m_count"] = len(topology["m_mem_data"])
+    return {"mem_topology": topology}
+
+
+def _as_str(obj):
+    if type(obj) is bytes:
+        return obj.decode()
+    return obj
+
+
+def _create_xclbin(mem_dict):
+    """Create an XCLBIN file containing the specified memories"""
+    import json
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "metadata.xml").write_text(BLANK_METADATA)
+        (td / "mem.json").write_text(json.dumps(_ip_to_topology(mem_dict)))
+        completion = subprocess.run(
+            [
+                "xclbinutil",
+                "--add-section=EMBEDDED_METADATA:RAW:metadata.xml",
+                "--add-section=MEM_TOPOLOGY:JSON:mem.json",
+                "--output",
+                "t.xclbin",
+                "--skip-bank-grouping",
+            ],
+            cwd=td,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if completion.returncode != 0:
+            raise RuntimeError("xclbinutil failed: " + _as_str(completion.stdout))
+        return (td / "t.xclbin").read_bytes()
+
+
+ZU_FPD_SLCR_REG = {
+    "C_MAXIGP0_DATA_WIDTH": {
+        "FPD_SLCR.AXI_FS.DW_SS0_SEL": {"addr": 0xFD615000, "field": [9, 8]}
+    },
+    "C_MAXIGP1_DATA_WIDTH": {
+        "FPD_SLCR.AXI_FS.DW_SS1_SEL": {"addr": 0xFD615000, "field": [11, 10]}
+    },
+
