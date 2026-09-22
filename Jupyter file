@@ -121,3 +121,94 @@ in_buf.freebuffer()
 out_buf.freebuffer()
 
  * Verification: The terminal prints the execution times for both targets and reports a hardware speedup factor.
+
+
+
+
+
+
+
+For PYNQ USB web cam live Feed 
+
+import cv2
+import numpy as np
+import time
+from pynq import Overlay, allocate
+
+# 1. Load Bitstream & Hardware IP
+ol = Overlay("harris_kv260.bit")
+dma = ol.axi_dma_0
+harris_ip = ol.corner_harris_accel_0
+
+WIDTH = 640
+HEIGHT = 480
+harris_ip.register_map.rows = HEIGHT
+harris_ip.register_map.cols = WIDTH
+harris_ip.register_map.threshold = 442
+harris_ip.register_map.k_scaled = 2621
+
+# 2. Allocate DMA Buffers Once (Reuse Across Frames)
+in_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+
+# 3. Open USB Webcam
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+
+if not cap.isOpened():
+    raise RuntimeError("Could not open USB camera on /dev/video0")
+
+print("Starting live FPGA accelerator stream.")
+print("Click on the OpenCV window and press 'q' to stop.")
+
+try:
+    fps_start = time.time()
+    frames_processed = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to capture frame from webcam.")
+            break
+
+        # Resize to guarantee geometry matches hardware registers
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+
+        # Convert to Grayscale & copy to DMA input buffer
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        np.copyto(in_buf, gray)
+
+        # 4. Hardware Acceleration Pipeline
+        dma.recvchannel.transfer(out_buf)
+        harris_ip.register_map.CTRL.AP_START = 1
+        dma.sendchannel.transfer(in_buf)
+        dma.sendchannel.wait()
+        dma.recvchannel.wait()
+
+        # 5. Overlay Detected Corners (pixels marked as 255)
+        ys, xs = np.where(out_buf == 255)
+        for x, y in zip(xs, ys):
+            cv2.circle(frame, (x, y), radius=3, color=(0, 255, 0), thickness=-1)
+
+        # Calculate and display FPS
+        frames_processed += 1
+        elapsed = time.time() - fps_start
+        fps = frames_processed / elapsed if elapsed > 0 else 0
+        cv2.putText(frame, f"FPGA FPS: {fps:.1f}", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # 6. Render Native Display Window
+        cv2.imshow("Kria KV260 - Real-Time Harris Corner Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    # Always release resources and DMA buffers cleanly
+    cap.release()
+    cv2.destroyAllWindows()
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    print("Camera stream closed and DMA buffers freed.")
+
