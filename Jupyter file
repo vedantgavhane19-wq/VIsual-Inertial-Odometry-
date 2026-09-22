@@ -1,0 +1,123 @@
+Here is the complete Jupyter Notebook code divided into sequential cells for /home/ubuntu/harris_demo.
+Cell 1: Load Overlay and Bind Hardware Blocks
+Paste this into the first cell to program the Zynq UltraScale+ programmable logic and map the AXI registers:
+import time
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from pynq import Overlay, allocate
+
+# 1. Load Bitstream
+ol = Overlay("harris_kv260.bit")
+
+# 2. Assign Hardware Handles
+dma = ol.axi_dma_0
+harris_ip = ol.corner_harris_accel_0
+
+print("FPGA Bitstream loaded successfully!")
+print("Detected IP blocks:", list(ol.ip_dict.keys()))
+
+ * Verification: The cell prints FPGA Bitstream loaded successfully! and lists axi_dma_0 and corner_harris_accel_0 without throwing an OSError.
+Cell 2: Synthetic Test Pattern and Visual Validation
+Paste this into the second cell to stream a high-contrast geometry pattern through the DMA engine and plot the detected corner coordinates inline:
+# Configure dimensions (VGA 640x480)
+WIDTH = 640
+HEIGHT = 480
+
+# 1. Program HLS AXI-Lite registers
+harris_ip.register_map.rows = HEIGHT
+harris_ip.register_map.cols = WIDTH
+harris_ip.register_map.threshold = 442
+harris_ip.register_map.k_scaled = 2621  # 0.04 scaled in fixed-point
+
+# 2. Allocate contiguous physical memory
+in_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+
+# 3. Create a synthetic test image with crisp corners
+test_img = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+# Add a white central rectangle
+test_img[120:360, 160:480] = 255
+# Add a smaller dark box inside to create 8 total corners
+test_img[180:300, 240:400] = 0
+np.copyto(in_buf, test_img)
+
+# 4. Arm the receive channel FIRST (prevents AXI-Stream pipeline deadlock)
+dma.recvchannel.transfer(out_buf)
+
+# 5. Start the HLS IP core
+harris_ip.register_map.CTRL.AP_START = 1
+
+# 6. Stream input pixels through DMA send channel
+t0 = time.time()
+dma.sendchannel.transfer(in_buf)
+
+# 7. Wait for both DMA transfers to complete
+dma.sendchannel.wait()
+dma.recvchannel.wait()
+t1 = time.time()
+
+fpga_latency_ms = (t1 - t0) * 1000.0
+detected_corners = np.count_nonzero(out_buf == 255)
+
+print(f"FPGA Roundtrip Time: {fpga_latency_ms:.2f} ms")
+print(f"Detected Corner Points: {detected_corners}")
+
+# 8. Plot input vs detected corners side-by-side
+fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+ax[0].imshow(in_buf, cmap='gray')
+ax[0].set_title("Input Synthetic Image (640x480)")
+ax[0].axis('off')
+
+# Overlay detected corners (red markers) on the grayscale image
+ax[1].imshow(in_buf, cmap='gray')
+y_coords, x_coords = np.where(out_buf == 255)
+ax[1].scatter(x_coords, y_coords, color='red', s=30, label='Hardware Corner')
+ax[1].set_title(f"FPGA Harris Output ({detected_corners} corners)")
+ax[1].legend(loc="upper right")
+ax[1].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+# 9. Free memory allocations
+in_buf.freebuffer()
+out_buf.freebuffer()
+
+ * Verification: A two-panel plot appears showing red scatter points clustered at the corners of the shapes, and the execution completes in under 15 ms.
+Cell 3: FPGA Hardware vs. Arm CPU Benchmark
+Paste this into the third cell to compare the FPGA hardware execution time against OpenCV running purely on the quad-core Arm Cortex-A53 CPU:
+# 1. Re-allocate buffers for the benchmark
+in_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+np.copyto(in_buf, test_img)
+
+# --- Benchmark FPGA Acceleration ---
+dma.recvchannel.transfer(out_buf)
+harris_ip.register_map.CTRL.AP_START = 1
+
+start_fpga = time.time()
+dma.sendchannel.transfer(in_buf)
+dma.sendchannel.wait()
+dma.recvchannel.wait()
+fpga_time = (time.time() - start_fpga) * 1000.0
+
+# --- Benchmark CPU OpenCV (cv2.cornerHarris) ---
+gray_float = np.float32(test_img)
+start_cpu = time.time()
+cpu_dst = cv2.cornerHarris(gray_float, blockSize=3, ksize=3, k=0.04)
+cpu_dst = cv2.dilate(cpu_dst, None)
+cpu_corners = np.where(cpu_dst > 0.01 * cpu_dst.max())
+cpu_time = (time.time() - start_cpu) * 1000.0
+
+speedup = cpu_time / fpga_time
+
+print(f"Arm CPU Execution Time: {cpu_time:.2f} ms")
+print(f"FPGA Accelerator Time:  {fpga_time:.2f} ms")
+print(f"Hardware Speedup:       {speedup:.2f}x faster")
+
+in_buf.freebuffer()
+out_buf.freebuffer()
+
+ * Verification: The terminal prints the execution times for both targets and reports a hardware speedup factor.
