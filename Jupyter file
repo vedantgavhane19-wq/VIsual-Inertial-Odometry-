@@ -239,26 +239,125 @@ finally:
 
 
 
+Restart the kernel first (Kernel → Restart), then run this as a single cell:
 
-Debug this precisely — add try/except around each step
-Run this single-shot version (not the full while loop) first, to isolate exactly which line throws:
+import time
+import cv2
+import numpy as np
+from IPython.display import Image, clear_output, display
+from pynq import Overlay, allocate
 
-print("Step 1: recv transfer")
-dma.recvchannel.transfer(out_buf)
-print("Step 1 OK")
+# ---------------------------------------------------------
+# 1. Load bitstream fresh (resets FPGA + clears stale DMA state)
+# ---------------------------------------------------------
+print("Loading overlay...")
+ol = Overlay("harris_kv260.bit")
+dma = ol.axi_dma_0
+harris_ip = ol.corner_harris_accel_0
+print("Overlay loaded OK")
+print(harris_ip.register_map)
 
-print("Step 2: AP_START")
-harris_ip.register_map.CTRL.AP_START = 1
-print("Step 2 OK, CTRL:", harris_ip.register_map.CTRL)
+# ---------------------------------------------------------
+# 2. Configure resolution & hardware registers
+# ---------------------------------------------------------
+WIDTH = 640
+HEIGHT = 480
+harris_ip.register_map.rows = HEIGHT
+harris_ip.register_map.cols = WIDTH
+harris_ip.register_map.threshold = 442
+harris_ip.register_map.k_scaled = 2621
 
-print("Step 3: send transfer")
-dma.sendchannel.transfer(in_buf)
-print("Step 3 OK")
+# ---------------------------------------------------------
+# 3. Allocate physically contiguous buffers
+# ---------------------------------------------------------
+in_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
 
-print("Step 4: send wait")
-dma.sendchannel.wait()
-print("Step 4 OK")
+# ---------------------------------------------------------
+# 4. One-shot hardware sanity test BEFORE starting the webcam loop
+#    (catches DMA/register issues early, with a synthetic frame)
+# ---------------------------------------------------------
+print("Running one-shot hardware test...")
+test_pattern = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+test_pattern[100:300, 100:300] = 255
+np.copyto(in_buf, test_pattern)
 
-print("Step 5: recv wait")
-dma.recvchannel.wait()
-print("Step 5 OK")
+try:
+    dma.recvchannel.transfer(out_buf)
+    harris_ip.register_map.CTRL.AP_START = 1
+    dma.sendchannel.transfer(in_buf)
+    dma.sendchannel.wait()
+    dma.recvchannel.wait()
+    print("Hardware test OK. Corners found:", np.count_nonzero(out_buf == 255))
+except RuntimeError as e:
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    raise RuntimeError(f"Hardware test failed before webcam loop: {e}")
+
+# ---------------------------------------------------------
+# 5. Open webcam
+# ---------------------------------------------------------
+print("Connecting to webcam...")
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+
+if not cap.isOpened():
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    raise RuntimeError("Could not open /dev/video0. Try VideoCapture(1) instead.")
+
+print("Streaming live feed. Press the Jupyter 'Stop' (square) button to halt.")
+
+# ---------------------------------------------------------
+# 6. Main live loop
+# ---------------------------------------------------------
+try:
+    fps_start = time.time()
+    frames = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Frame grab failed, stopping.")
+            break
+
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        np.copyto(in_buf, gray)
+
+        # Arm receive first, then start core, then send input
+        dma.recvchannel.transfer(out_buf)
+        harris_ip.register_map.CTRL.AP_START = 1
+        dma.sendchannel.transfer(in_buf)
+
+        dma.sendchannel.wait()
+        dma.recvchannel.wait()
+
+        ys, xs = np.where(out_buf == 255)
+        for x, y in zip(xs, ys):
+            cv2.circle(frame, (x, y), radius=2, color=(0, 255, 0), thickness=-1)
+
+        frames += 1
+        elapsed = time.time() - fps_start
+        fps = frames / elapsed if elapsed > 0 else 0
+        cv2.putText(frame, f"FPGA FPS: {fps:.1f}", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        clear_output(wait=True)
+        display(Image(data=jpeg.tobytes()))
+
+except KeyboardInterrupt:
+    print("Stream interrupted by user.")
+
+except RuntimeError as e:
+    print(f"DMA error during streaming: {e}")
+
+finally:
+    cap.release()
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    print("Webcam released and DMA memory deallocated.")
