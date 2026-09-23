@@ -236,3 +236,29 @@ finally:
   in_buf.freebuffer()
   out_buf.freebuffer()
   print("Webcam released and DMA memory deallocated.")
+
+
+
+
+Debug this precisely — add try/except around each step
+Run this single-shot version (not the full while loop) first, to isolate exactly which line throws:
+
+print("Step 1: recv transfer")
+dma.recvchannel.transfer(out_buf)
+print("Step 1 OK")
+
+print("Step 2: AP_START")
+harris_ip.register_map.CTRL.AP_START = 1
+print("Step 2 OK, CTRL:", harris_ip.register_map.CTRL)
+
+print("Step 3: send transfer")
+dma.sendchannel.transfer(in_buf)
+print("Step 3 OK")
+
+print("Step 4: send wait")
+dma.sendchannel.wait()
+print("Step 4 OK")
+
+print("Step 5: recv wait")
+dma.recvchannel.wait()
+print("Step 5 OK")
