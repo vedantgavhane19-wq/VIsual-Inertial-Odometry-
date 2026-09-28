@@ -5,6 +5,161 @@ import ipywidgets as widgets
 from IPython.display import display
 from pynq import Overlay, allocate
 
+# ---------------------------------------------------------------------------
+# 1. Load overlay
+#    design_1.hwh MUST be renamed to design_1_wrapper.hwh (same folder as the
+#    .bit), otherwise PYNQ can't find the IP metadata.
+# ---------------------------------------------------------------------------
+ol = Overlay("design_1_wrapper.bit")
+ip = ol.corner_harris_accel_0
+
+# Register offsets taken from design_1.hwh (s_axi_control, base 0xB0000000)
+CTRL    = 0x00
+SRC_LO  = 0x10   # src_1 : src[31:0]
+SRC_HI  = 0x14   # src_2 : src[63:32]
+DST_LO  = 0x1C   # dst_1 : dst[31:0]
+DST_HI  = 0x20   # dst_2 : dst[63:32]
+ROWS    = 0x28
+COLS    = 0x30
+THRESH  = 0x38
+K_SCALE = 0x40
+
+AP_START = 0x1
+AP_DONE  = 0x2
+AP_IDLE  = 0x4
+
+WIDTH, HEIGHT = 480, 320
+THRESHOLD = 442      # Vitis Vision example default; tune this
+K_SCALED  = 2621     # 0.04 * 65536
+MAX_DRAW  = 300      # max markers drawn per frame
+
+# ---------------------------------------------------------------------------
+# 2. Buffers
+# ---------------------------------------------------------------------------
+in_buf  = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+
+# ---------------------------------------------------------------------------
+# 3. Configure IP (direct register writes; 64-bit pointers are split in two)
+# ---------------------------------------------------------------------------
+def write64(lo, hi, value):
+    ip.write(lo, value & 0xFFFFFFFF)
+    ip.write(hi, (value >> 32) & 0xFFFFFFFF)
+
+write64(SRC_LO, SRC_HI, in_buf.physical_address)
+write64(DST_LO, DST_HI, out_buf.physical_address)
+ip.write(ROWS, HEIGHT)
+ip.write(COLS, WIDTH)
+ip.write(THRESH, THRESHOLD)
+ip.write(K_SCALE, K_SCALED)
+
+
+def run_ip(timeout=1.0):
+    """Start the kernel and wait for ap_done (with a timeout)."""
+    ip.write(CTRL, AP_START)
+    t0 = time.time()
+    while not (ip.read(CTRL) & AP_DONE):      # ap_done is clear-on-read
+        if time.time() - t0 > timeout:
+            raise TimeoutError(f"IP did not finish, CTRL=0x{ip.read(CTRL):02x}")
+
+
+def process(gray):
+    """gray: HxW uint8 -> returns the raw hardware output (copy)."""
+    np.copyto(in_buf, gray)
+    in_buf.flush()
+    out_buf[:] = 0            # so a stale result can never look like a detection
+    out_buf.flush()
+    run_ip()
+    out_buf.invalidate()
+    return np.array(out_buf)
+
+
+# ---------------------------------------------------------------------------
+# 4. Self-test on a synthetic checkerboard (no camera needed)
+#    Tells you what the output actually looks like before you debug the loop.
+# ---------------------------------------------------------------------------
+def selftest():
+    tile = 40
+    yy, xx = np.indices((HEIGHT, WIDTH))
+    board = (((yy // tile) + (xx // tile)) % 2 * 255).astype(np.uint8)
+    out = process(board)
+    print("unique output values:", np.unique(out)[:10])
+    print("non-zero pixels     :", int(np.count_nonzero(out)))
+    n, *_ = cv2.connectedComponentsWithStats((out > 0).astype(np.uint8), connectivity=8)
+    print("corner blobs        :", n - 1, "(checkerboard has ~", (WIDTH // tile - 1) * (HEIGHT // tile - 1), "inner corners)")
+
+selftest()
+
+# ---------------------------------------------------------------------------
+# 5. Widget + camera
+# ---------------------------------------------------------------------------
+image_widget = widgets.Image(format='jpeg', width=WIDTH, height=HEIGHT)
+display(image_widget)
+
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # much faster over USB
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+if not cap.isOpened():
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    raise RuntimeError("Could not open webcam.")
+
+try:
+    fps_start = time.time()
+    frames = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        result = process(gray)
+
+        # Cluster neighbouring hit pixels into one marker each
+        mask = (result > 0).astype(np.uint8)
+        n, _, _, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        corners = centroids[1:1 + MAX_DRAW]          # index 0 is the background
+        for cx, cy in corners:
+            cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+
+        frames += 1
+        fps = frames / (time.time() - fps_start)
+        cv2.putText(frame, f"FPGA FPS: {fps:.1f} | Corners: {n - 1}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        image_widget.value = jpeg.tobytes()
+
+except KeyboardInterrupt:
+    print("Stream interrupted by user.")
+
+finally:
+    cap.release()
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    print("Cleaned up hardware memory.")
+
+
+
+
+
+
+
+
+import time
+import cv2
+import numpy as np
+import ipywidgets as widgets
+from IPython.display import display
+from pynq import Overlay, allocate
+
 # 1. Load Bitstream
 ol = Overlay("design_1_wrapper.bit")
 harris_ip = ol.corner_harris_accel_0
