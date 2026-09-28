@@ -1,14 +1,13 @@
 import time
 import cv2
 import numpy as np
-from IPython.display import Image, clear_output, display
+import ipywidgets as widgets
+from IPython.display import display
 from pynq import Overlay, allocate
 
-# 1. Load Bitstream (No DMA block to initialize anymore!)
-ol = Overlay("harris_kv260.bit")
+# 1. Load Bitstream
+ol = Overlay("design_1_wrapper.bit")
 harris_ip = ol.corner_harris_accel_0
-
-print("Bitstream loaded. Detected IPs:", list(ol.ip_dict.keys()))
 
 # 2. Configure Dimensions & Registers
 WIDTH = 1280
@@ -16,19 +15,23 @@ HEIGHT = 720
 
 harris_ip.register_map.rows = HEIGHT
 harris_ip.register_map.cols = WIDTH
-harris_ip.register_map.threshold = 442
+harris_ip.register_map.threshold = 150
 harris_ip.register_map.k_scaled = 2621
 
-# 3. Allocate Contiguous Memory (Now kept as 2D arrays!)
+# 3. Allocate Contiguous Memory 
 in_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
 out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
 
 # 4. Pass Physical Memory Pointers to the HLS IP
-# This tells the AXI4 Master interface exactly where to read/write in DDR RAM
 harris_ip.register_map.src = in_buf.physical_address
 harris_ip.register_map.dst = out_buf.physical_address
 
-# 5. Open Webcam
+# 5. Initialize the Flicker-Free Widget
+# This creates a blank image container in the notebook once
+image_widget = widgets.Image(format='jpeg', width=WIDTH, height=HEIGHT)
+display(image_widget)
+
+# 6. Open Webcam
 cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -41,7 +44,7 @@ if not cap.isOpened():
 try:
     fps_start = time.time()
     frames = 0
-
+    
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -54,42 +57,33 @@ try:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         np.copyto(in_buf, gray)
 
-        # Flush CPU cache to ensure FPGA sees the new pixels
+        # 1. Push input pixels from CPU cache down to physical DDR RAM
         in_buf.flush()
-        out_buf.invalidate()
 
-        # 6. Start the HLS Accelerator
+        # 2. Start hardware processing
         harris_ip.register_map.CTRL.AP_START = 1
 
-        # 7. Poll the AP_DONE bit (Bit 1) to wait for hardware completion
-        # The IP will fetch the data via m_axi, process it, and write it back automatically
+        # 3. Wait for hardware completion
         while harris_ip.register_map.CTRL.AP_DONE == 0:
             pass
 
-        # Mark detected corners
+        # 4. CRITICAL FIX: Pull the fresh FPGA output from DDR RAM up into CPU cache
+        out_buf.invalidate()
+
+        # 5. Mark detected corners (now the CPU can actually see the 255s)
         ys, xs = np.where(out_buf == 255)
         for x, y in zip(xs, ys):
-            cv2.circle(frame, (x, y), radius=2, color=(0, 255, 0), thickness=-1)
+            cv2.circle(frame, (x, y), radius=3, color=(0, 255, 0), thickness=-1)
 
-        # FPS calculation and display
         frames += 1
         elapsed = time.time() - fps_start
         fps = frames / elapsed if elapsed > 0 else 0
-        cv2.putText(frame, f"FPGA FPS: {fps:.1f}", (15, 30), 
+        cv2.putText(frame, f"FPGA FPS: {fps:.1f} | Corners: {len(xs)}", (15, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
+        # Update widget in-place
         _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        clear_output(wait=True)
-        display(Image(data=jpeg.tobytes()))
-
-except KeyboardInterrupt:
-    print("Stream interrupted by user.")
-    
-finally:
-    cap.release()
-    in_buf.freebuffer()
-    out_buf.freebuffer()
-    print("Cleaned up hardware memory.")
+        image_widget.value = jpeg.tobytes()
 
 
 
