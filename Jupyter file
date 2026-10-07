@@ -196,14 +196,46 @@ def run_ip(timeout=1.0):
 # 2. Benchmarking Routines
 def process_pl(gray):
     np.copyto(in_buf, gray)
-    t_start = time.perf_counter()
+    
+    # 1. Total System Round-Trip Start
+    t_system_start = time.perf_counter()
+    
     in_buf.flush()
     out_buf[:] = 0
     out_buf.flush()
-    run_ip()
+    
+    # --- PURE IP EXECUTION START ---
+    t_ip_start = time.perf_counter()
+    
+    harris_ip.register_map.CTRL.AP_START = 1
+    while harris_ip.register_map.CTRL.AP_DONE == 0:
+        pass  # Waiting for hardware
+        
+    t_ip_end = time.perf_counter()
+    # --- PURE IP EXECUTION END ---
+    
     out_buf.invalidate()
-    t_end = time.perf_counter()
-    return np.array(out_buf), (t_end - t_start) * 1000.0
+    
+    t_system_end = time.perf_counter()
+    
+    # 2. Calculate Latencies in Milliseconds
+    total_pl_ms = (t_system_end - t_system_start) * 1000.0
+    pure_ip_ms = (t_ip_end - t_ip_start) * 1000.0
+    
+    # 3. Calculate Clock Cycles (Assuming 100 MHz pl_clk0)
+    clock_freq_hz = 100_000_000  
+    pure_ip_seconds = (t_ip_end - t_ip_start)
+    estimated_cycles = int(pure_ip_seconds * clock_freq_hz)
+    
+    # Print it to the console once every 30 frames to avoid spamming
+    if hasattr(process_pl, "counter"):
+        process_pl.counter += 1
+        if process_pl.counter % 30 == 0:
+            print(f"Pure IP Latency: {pure_ip_ms:.2f} ms | Hardware Cycles: {estimated_cycles:,}")
+    else:
+        process_pl.counter = 1
+    
+    return np.array(out_buf), total_pl_ms
 
 def process_ps(gray):
     t_start = time.perf_counter()
