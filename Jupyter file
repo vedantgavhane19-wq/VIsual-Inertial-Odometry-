@@ -152,6 +152,7 @@ finally:
 
 
 
+
 import time
 import cv2
 import numpy as np
@@ -222,8 +223,8 @@ def process_pl(gray):
     total_pl_ms = (t_system_end - t_system_start) * 1000.0
     pure_ip_ms = (t_ip_end - t_ip_start) * 1000.0
     
-    # 3. Calculate Clock Cycles (Assuming 100 MHz pl_clk0)
-    clock_freq_hz = 100_000_000  
+    # 3. Calculate Clock Cycles (Assuming 200 MHz pl_clk0)
+    clock_freq_hz = 200_000_000  
     pure_ip_seconds = (t_ip_end - t_ip_start)
     estimated_cycles = int(pure_ip_seconds * clock_freq_hz)
     
@@ -279,7 +280,7 @@ try:
         fps = frames / (time.time() - fps_start)
         
         cv2.putText(frame, f"FPS: {fps:.1f} | Corners: {n - 1}", (10, 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
         cv2.putText(frame, f"PS (CPU): {ps_ms:.1f} ms", (10, 50), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 255), 2)
         cv2.putText(frame, f"PL (FPGA): {pl_ms:.1f} ms", (10, 75), 
@@ -289,7 +290,7 @@ try:
         image_widget.value = jpeg.tobytes()
 
 except KeyboardInterrupt:
-    print("Stream stopped.")
+    print("Stream stopped." )
 finally:
     cap.release()
     in_buf.freebuffer()
