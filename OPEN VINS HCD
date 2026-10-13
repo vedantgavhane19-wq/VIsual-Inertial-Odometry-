@@ -1,0 +1,52 @@
+// --- START CUSTOM FPGA ACCELERATOR ---
+static int mem_fd = -1, udma_fd = -1;
+static volatile uint32_t* axi = nullptr;
+static uint8_t* shared_mem = nullptr;
+const uint64_t phys_in = 0x3b100000ULL; // Your active udmabuf physical address
+const size_t frame_bytes = 480 * 320;
+
+// 1. Initialize hardware mapping ONCE
+if (mem_fd == -1) {
+    udma_fd = open("/dev/udmabuf0", O_RDWR);
+    shared_mem = (uint8_t*)mmap(NULL, frame_bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, udma_fd, 0);
+    
+    mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    axi = (volatile uint32_t*)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0xB0000000);
+    
+    axi[0x10/4] = (uint32_t)(phys_in & 0xFFFFFFFF);
+    axi[0x14/4] = (uint32_t)(phys_in >> 32);
+    axi[0x1C/4] = (uint32_t)((phys_in + frame_bytes) & 0xFFFFFFFF);
+    axi[0x20/4] = (uint32_t)((phys_in + frame_bytes) >> 32);
+    axi[0x28/4] = 320;
+    axi[0x30/4] = 480;
+    axi[0x38/4] = threshold; // Link FPGA threshold to OpenVINS config
+    axi[0x40/4] = 2621;
+}
+
+// 2. Resize EuRoC frame (752x480) to FPGA frame (480x320)
+cv::Mat img_fpga;
+cv::resize(img0pyr.at(0), img_fpga, cv::Size(480, 320));
+memcpy(shared_mem, img_fpga.data, frame_bytes);
+memset(shared_mem + frame_bytes, 0, frame_bytes); // Clear output buffer
+
+// 3. Flush Cache & Trigger FPGA
+int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+if(sync_dev >= 0) { if(write(sync_dev, "1", 1)<0){} close(sync_dev); }
+
+axi[0x00/4] = 0x1;
+while (!(axi[0x00/4] & 0x2)) {}
+
+int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+if(sync_cpu >= 0) { if(write(sync_cpu, "1", 1)<0){} close(sync_cpu); }
+
+// 4. Read mask and scale coordinates back to EuRoC space
+cv::Mat mask_fpga(320, 480, CV_8UC1, shared_mem + frame_bytes);
+std::vector<cv::Point> corners;
+cv::findNonZero(mask_fpga, corners);
+
+for (const auto& pt : corners) {
+    float u_euroc = pt.x * (752.0f / 480.0f);
+    float v_euroc = pt.y * (480.0f / 320.0f);
+    pts0_ext.push_back(cv::KeyPoint(u_euroc, v_euroc, 1.0f));
+}
+// --- END CUSTOM FPGA ACCELERATOR ---
