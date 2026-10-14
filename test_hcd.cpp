@@ -11,7 +11,7 @@
 int main() {
     const int width = 480, height = 320;
     const size_t frame_bytes = width * height;
-    const uint64_t phys_in  = 0x3b100000ULL; // Your active physical address
+    const uint64_t phys_in  = 0x3a800000ULL; // Your active physical address
     const uint64_t phys_out = phys_in + frame_bytes;
 
     std::cout << "1. Mapping udmabuf (Cached)..." << std::endl;
@@ -55,8 +55,19 @@ int main() {
     int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
     if(sync_dev >= 0) { write(sync_dev, "1", 1); close(sync_dev); }
 
-    axi[0x00/4] = 0x1;
-    while (!(axi[0x00/4] & 0x2)) {}
+    axi[0x00/4] = 0x0;
+    int timeout = 0;
+    usleep(100);
+    axi[0x00/4] = 0x1;	
+
+    while (!(axi[0x00/4] & 0x2)) {
+	timeout++;
+	if (timeout > 1000000){
+		printf("[FPGA ERROR] TIMEOUT! Hardware deadlocked. AXI Control state : 0x%X\n", axi[0x00/4]);
+		break;
+}
+	usleep(10);
+}
 
     // Invalidate CPU cache so OpenCV sees what the FPGA wrote to DDR
     int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
