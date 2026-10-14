@@ -22,7 +22,17 @@
 int main() {
     const int width = 480, height = 320;
     const size_t frame_bytes = width * height;
-    const uint64_t phys_in  = 0x39000000ULL;
+
+    // 1. Read physical address dynamically
+    uint64_t phys_in = 0;
+    FILE* f = fopen("/sys/class/u-dma-buf/udmabuf0/phys_addr", "r");
+    if (f) {
+        fscanf(f, "%lx", &phys_in);
+        fclose(f);
+    } else {
+        std::cerr << "Failed to read phys_addr!" << std::endl;
+        return 1;
+    }
     const uint64_t phys_out = phys_in + frame_bytes;
 
     int udma_fd = open("/dev/udmabuf0", O_RDWR | O_SYNC);
@@ -52,10 +62,28 @@ int main() {
     }
     memset(out_buf, 0, frame_bytes);
 
+    // 2. Flush CPU cache to DDR
+    int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+    if(sync_dev >= 0) { write(sync_dev, "1", 1); close(sync_dev); }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     axi[CTRL] = 0x1; // AP_START
-    while (!(axi[CTRL] & 0x2)) {} // Wait for AP_DONE
+    
+    // 3. Safe timeout loop
+    int timeout = 0;
+    while (!(axi[CTRL] & 0x2)) {
+        timeout++;
+        if (timeout > 1000000){
+            std::cout << "[FPGA ERROR] TIMEOUT! Hardware deadlocked." << std::endl;
+            break;
+        }
+        usleep(10);
+    }
     auto t1 = std::chrono::high_resolution_clock::now();
+
+    // 4. Invalidate CPU cache to read FPGA results
+    int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+    if(sync_cpu >= 0) { write(sync_cpu, "1", 1); close(sync_cpu); }
 
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     cv::Mat mask(height, width, CV_8UC1, out_buf);
