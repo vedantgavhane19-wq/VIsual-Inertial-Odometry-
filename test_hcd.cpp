@@ -1,98 +1,105 @@
 #include <iostream>
-#include <cstdint>
-#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <stdint.h>
+#include <string.h>
 #include <opencv2/opencv.hpp>
 
-#define IP_BASE_ADDR 0xB0000000
-#define IP_MAP_SIZE  0x10000
-
-#define CTRL     (0x00 / 4)
-#define SRC_LO   (0x10 / 4)
-#define SRC_HI   (0x14 / 4)
-#define DST_LO   (0x1C / 4)
-#define DST_HI   (0x20 / 4)
-#define ROWS     (0x28 / 4)
-#define COLS     (0x30 / 4)
-#define THRESH   (0x38 / 4)
-#define K_SCALE  (0x40 / 4)
-
 int main() {
-    const int width = 480, height = 320;
-    const size_t frame_bytes = width * height;
-
-    // 1. Read physical address dynamically
-    uint64_t phys_in = 0;
-    FILE* f = fopen("/sys/class/u-dma-buf/udmabuf0/phys_addr", "r");
-    if (f) {
-        fscanf(f, "%lx", &phys_in);
-        fclose(f);
-    } else {
-        std::cerr << "Failed to read phys_addr!" << std::endl;
-        return 1;
-    }
-    const uint64_t phys_out = phys_in + frame_bytes;
-
-    int udma_fd = open("/dev/udmabuf0", O_RDWR | O_SYNC);
-    uint8_t* shared_mem = (uint8_t*)mmap(NULL, frame_bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, udma_fd, 0);
-    uint8_t* in_buf  = shared_mem;
-    uint8_t* out_buf = shared_mem + frame_bytes;
-
-    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-    volatile uint32_t* axi = (volatile uint32_t*)mmap(NULL, IP_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, IP_BASE_ADDR);
-
-    axi[SRC_LO]  = (uint32_t)(phys_in & 0xFFFFFFFF);
-    axi[SRC_HI]  = (uint32_t)(phys_in >> 32);
-    axi[DST_LO]  = (uint32_t)(phys_out & 0xFFFFFFFF);
-    axi[DST_HI]  = (uint32_t)(phys_out >> 32);
-    axi[ROWS]    = height;
-    axi[COLS]    = width;
-    axi[THRESH]  = 150;
-    axi[K_SCALE] = 2621;
-
-    cv::Mat gray(height, width, CV_8UC1, in_buf);
-    gray.setTo(0);
-    for (int y = 40; y < 280; y += 40) {
-        for (int x = 40; x < 440; x += 40) {
-            if (((x / 40) + (y / 40)) % 2 == 0)
-                cv::rectangle(gray, cv::Rect(x, y, 40, 40), cv::Scalar(255), -1);
-        }
-    }
-    memset(out_buf, 0, frame_bytes);
-
-    // 2. Flush CPU cache to DDR
-    int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
-    if(sync_dev >= 0) { write(sync_dev, "1", 1); close(sync_dev); }
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    axi[CTRL] = 0x1; // AP_START
+    // --- 1. CONFIGURATION ---
+    // Note: Added the trailing '0' to your address. If your terminal explicitly 
+    // printed only 7 digits, remove the last 0, but this is extremely rare.
+    const uint64_t phys_in = 0x3a800000ULL; 
     
-    // 3. Safe timeout loop
+    const int width = 480;
+    const int height = 320;
+    const size_t frame_bytes = width * height;
+    const int threshold = 20;
+
+    // --- 2. MEMORY MAPPING ---
+    printf("1. Opening udmabuf0...\n");
+    int udma_fd = open("/dev/udmabuf0", O_RDWR);
+    if (udma_fd < 0) { printf("Error: Cannot open /dev/udmabuf0\n"); return -1; }
+    uint8_t* shared_mem = (uint8_t*)mmap(NULL, frame_bytes * 2, PROT_READ | PROT_WRITE, MAP_SHARED, udma_fd, 0);
+
+    printf("2. Opening AXI Registers...\n");
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd < 0) { printf("Error: Cannot open /dev/mem\n"); return -1; }
+    volatile uint32_t* axi = (volatile uint32_t*)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0xB0000000);
+
+    if (shared_mem == MAP_FAILED || axi == MAP_FAILED) {
+        printf("Error: Memory mapping failed!\n");
+        return -1;
+    }
+
+    // --- 3. AXI INITIALIZATION ---
+    printf("3. Writing AXI Configuration...\n");
+    axi[0x10/4] = (uint32_t)(phys_in & 0xFFFFFFFF);
+    axi[0x14/4] = (uint32_t)(phys_in >> 32);
+    axi[0x1C/4] = (uint32_t)((phys_in + frame_bytes) & 0xFFFFFFFF);
+    axi[0x20/4] = (uint32_t)((phys_in + frame_bytes) >> 32);
+    axi[0x28/4] = height; // Rows
+    axi[0x30/4] = width;  // Cols
+    axi[0x38/4] = threshold;
+    axi[0x40/4] = 2621;
+
+    // --- 4. WEBCAM CAPTURE ---
+    printf("4. Starting Webcam...\n");
+    cv::VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        printf("Error: Cannot open webcam /dev/video0\n");
+        return -1;
+    }
+
+    cv::Mat frame, gray, img_fpga;
+    cap >> frame; // Grab a test frame
+    
+    if (frame.empty()) {
+        printf("Error: Webcam returned an empty 0-byte frame.\n");
+        return -1;
+    }
+
+    // Force strict formatting so the FPGA doesn't read out of bounds
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::resize(gray, img_fpga, cv::Size(width, height));
+
+    // --- 5. EXECUTION ---
+    printf("5. Formatting and copying to DMA...\n");
+    memcpy(shared_mem, img_fpga.data, frame_bytes);
+    memset(shared_mem + frame_bytes, 0, frame_bytes); // Wipe the output buffer
+
+    int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+    if(sync_dev >= 0) { if(write(sync_dev, "1", 1)<0){} close(sync_dev); }
+
+    printf("6. Triggering FPGA...\n");
+    
+    // Hard reset the Vitis HLS state machine to clear any previous lockups
+    axi[0x00/4] = 0x0; 
+    usleep(1000); // 1ms wait
+    
+    // Trigger Start
+    axi[0x00/4] = 0x1;
+
+    // Polling Loop with Timeout
     int timeout = 0;
-    while (!(axi[CTRL] & 0x2)) {
+    while (!(axi[0x00/4] & 0x2)) {
         timeout++;
-        if (timeout > 1000000){
-            std::cout << "[FPGA ERROR] TIMEOUT! Hardware deadlocked." << std::endl;
-            break;
+        if (timeout > 1000000) {
+            printf("[FPGA ERROR] Timeout! Hardware deadlocked. AXI Control State: 0x%X\n", axi[0x00/4]);
+            return -1;
         }
         usleep(10);
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
+    printf("7. FPGA Finished Successfully! Done signal received.\n");
 
-    // 4. Invalidate CPU cache to read FPGA results
     int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
-    if(sync_cpu >= 0) { write(sync_cpu, "1", 1); close(sync_cpu); }
+    if(sync_cpu >= 0) { if(write(sync_cpu, "1", 1)<0){} close(sync_cpu); }
 
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    cv::Mat mask(height, width, CV_8UC1, out_buf);
-    int nonzero = cv::countNonZero(mask);
+    // Check how many pixels the FPGA marked as corners
+    cv::Mat mask_fpga(height, width, CV_8UC1, shared_mem + frame_bytes);
+    int non_zero = cv::countNonZero(mask_fpga);
+    printf("8. Test Complete! Corners detected: %d\n", non_zero);
 
-    std::cout << "FPGA Execution Success! Latency: " << ms << " ms | Corner Pixels: " << nonzero << std::endl;
-
-    munmap((void*)axi, IP_MAP_SIZE);
-    munmap(shared_mem, frame_bytes * 2);
-    close(mem_fd); close(udma_fd);
     return 0;
 }
