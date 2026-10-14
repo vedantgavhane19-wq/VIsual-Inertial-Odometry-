@@ -50,13 +50,18 @@ int main() {
     axi[0x38/4] = threshold;
     axi[0x40/4] = 2621;
 
-    // 4. Webcam Capture
-    printf("4. Starting Webcam...\n");
+   // --- 4. WEBCAM CAPTURE ---
+    printf("4. Starting Webcam and warming up auto-exposure...\n");
     cv::VideoCapture cap(0);
     if (!cap.isOpened()) return -1;
 
     cv::Mat frame, gray, img_fpga;
-    cap >> frame; 
+    
+    // NEW: Read and discard 30 frames to let the camera brighten up
+    for(int i = 0; i < 30; i++) {
+        cap >> frame;
+    }
+    
     if (frame.empty()) {
         printf("Error: Webcam returned an empty 0-byte frame.\n");
         return -1;
@@ -64,8 +69,11 @@ int main() {
 
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
     cv::resize(gray, img_fpga, cv::Size(width, height));
+    
+    // NEW: Save the input image so you can physically see what the FPGA sees
+    cv::imwrite("debug_input.jpg", img_fpga);
 
-    // 5. Execution
+    // --- 5. EXECUTION ---
     printf("5. Formatting and copying to DMA...\n");
     memcpy(shared_mem, img_fpga.data, frame_bytes);
     memset(shared_mem + frame_bytes, 0, frame_bytes); 
@@ -73,20 +81,22 @@ int main() {
     int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
     if(sync_dev >= 0) { 
         ssize_t dummy = write(sync_dev, "1", 1); 
-        (void)dummy; // Suppress compiler warning
+        (void)dummy; 
         close(sync_dev); 
     }
 
     printf("6. Triggering FPGA...\n");
     
-    // Trigger Start directly (Removed the 0x0 reset that causes AXI freezes)
+    // NEW: Lower the threshold from 20 to 5 to force detections
+    axi[0x38/4] = 5; 
+    
     axi[0x00/4] = 0x1;
 
     int timeout = 0;
     while (!(axi[0x00/4] & 0x2)) {
         timeout++;
         if (timeout > 1000000) {
-            printf("[FPGA ERROR] Timeout! Hardware deadlocked. AXI Control State: 0x%X\n", axi[0x00/4]);
+            printf("[FPGA ERROR] Timeout! Hardware deadlocked.\n");
             return -1;
         }
         usleep(10);
@@ -96,13 +106,17 @@ int main() {
     int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
     if(sync_cpu >= 0) { 
         ssize_t dummy = write(sync_cpu, "1", 1); 
-        (void)dummy; // Suppress compiler warning
+        (void)dummy; 
         close(sync_cpu); 
     }
 
     cv::Mat mask_fpga(height, width, CV_8UC1, shared_mem + frame_bytes);
     int non_zero = cv::countNonZero(mask_fpga);
     printf("8. Test Complete! Corners detected: %d\n", non_zero);
+    
+    // NEW: Multiply by 255 to make the corners visible (white) and save it
+    cv::Mat visible_mask = mask_fpga * 255;
+    cv::imwrite("debug_corners.jpg", visible_mask);
 
     return 0;
 }
