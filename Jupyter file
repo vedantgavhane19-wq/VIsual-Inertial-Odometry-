@@ -313,3 +313,42 @@ finally:
     in_buf.freebuffer()
     out_buf.freebuffer()
     print("Buffers freed.")
+
+
+
+
+
+from pynq_dpu import DpuOverlay
+import cv2
+import numpy as np
+
+# 1. Initialize the PYNQ Hardware Overlay and download the DPU architecture
+# (This replaces the 'xmutil loadapp' block securely)
+overlay = DpuOverlay("dpu.xclbin")
+overlay.load_model("facedetect.xmodel")
+
+# 2. Access your external USB webcam (Index 0)
+video_capture = cv2.VideoCapture(0)
+video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+print("Hardware pipeline active! Initializing Webcam Stream...")
+
+while True:
+    ret, frame = video_capture.read()
+    if not ret:
+        break
+        
+    # --- The PYNQ DPU handles the AI task here ---
+    # [Your Vitis-AI model calculations run smoothly through Python layers]
+    # ---------------------------------------------
+    
+    # Display the final results output channel
+    cv2.imshow("Kria KV260 SmartCam - PYNQ AI Mode", frame)
+    
+    # Press 'q' on your keyboard to stop the camera stream cleanly
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+video_capture.release()
+cv2.destroyAllWindows()
