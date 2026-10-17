@@ -300,6 +300,8 @@ echo "================================================================="
 
 
 
+sudo wget https://www.xilinx.com/bin/public/openDownload?filename=densebox_320_320-kv260-r2.5.0.tar.gz -O densebox_320_320.tar.gz
+
 
 
 
