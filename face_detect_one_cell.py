@@ -1,205 +1,193 @@
-from pynq import Overlay, allocate
-import numpy as np
-import cv2
-import json
 import time
+import cv2
+import numpy as np
+from IPython.display import Image, clear_output, display
+from pynq import MMIO, Overlay, allocate
 
-# Load the bitstream (PYNQ parses face_detect.hwh automatically)
-ol = Overlay("face_detect.bit")
+# -------------------------------------------------------------------------
+# 1. Hardware & Register Definitions
+# -------------------------------------------------------------------------
+BIT_FILE = "face_detect.bit"  # face_detect.hwh must be in the same folder
+CTRL_BASE = 0xA0000000  # s_axi_control base address
+MAX_W, MAX_H, MAX_HITS = 320, 240, 4096
+WIN = 24  # Base window size (24x24)
 
-# Access the accelerator IP
-accel = ol.face_detect_0
+# Register offsets (from HLS hardware handoff)
+REG_CTRL = 0x00
+REG_RET = 0x10
+REG_FRAME_LO, REG_FRAME_HI = 0x18, 0x1C
+REG_HITS_LO, REG_HITS_HI = 0x24, 0x28
+REG_WIDTH, REG_HEIGHT = 0x30, 0x38
 
-# Verify register accessibility
-print("IP Status: Loaded successfully")
-print(accel.register_map)
+# Download overlay and map control registers
+ol = Overlay(BIT_FILE)
+ip = MMIO(CTRL_BASE, 0x10000)
 
-
-
-# 1. Allocate DMA buffers (physically contiguous memory)
-# Frame buffer: 320x240 8-bit grayscale
-img_buf = allocate(shape=(240, 320), dtype=np.uint8)
-
-# Output buffer: 4096 32-bit integers ((y << 16) | x)
-MAX_HITS = 4096
+# Allocate physically contiguous DMA buffers
+frame_buf = allocate(shape=(MAX_W * MAX_H,), dtype=np.uint8)
 hits_buf = allocate(shape=(MAX_HITS,), dtype=np.uint32)
 
-def run_hardware_detector(frame_gray):
-    """Sends one scale level to the PL accelerator and reads back hits."""
-    h, w = frame_gray.shape
-    if h > 240 or w > 320:
-        raise ValueError(f"Resolution {w}x{h} exceeds hardware maximum 320x240.")
+# -------------------------------------------------------------------------
+# 2. Kernel Driver & Box Grouping
+# -------------------------------------------------------------------------
+def run_kernel(img, timeout_s=3.0):
+  """Sends one pyramid level to the FPGA accelerator and returns hits."""
+  h, w = img.shape
 
-    # Copy frame to buffer and push to DDR
-    img_buf[:h, :w] = frame_gray
-    img_buf.sync_to_device()
+  # Copy frame to DMA memory and flush CPU cache
+  frame_buf[: w * h] = img.ravel()
+  frame_buf.sync_to_device()
 
-    # Pass 64-bit addresses into register map
-    frame_addr = img_buf.device_address
-    hits_addr = hits_buf.device_address
+  # Write physical memory addresses and image dimensions
+  fa = int(frame_buf.device_address)
+  ha = int(hits_buf.device_address)
+  ip.write(REG_FRAME_LO, fa & 0xFFFFFFFF)
+  ip.write(REG_FRAME_HI, fa >> 32)
+  ip.write(REG_HITS_LO, ha & 0xFFFFFFFF)
+  ip.write(REG_HITS_HI, ha >> 32)
+  ip.write(REG_WIDTH, w)
+  ip.write(REG_HEIGHT, h)
 
-    accel.register_map.frame_1 = frame_addr & 0xFFFFFFFF
-    accel.register_map.frame_2 = (frame_addr >> 32) & 0xFFFFFFFF
-    accel.register_map.hits_1 = hits_addr & 0xFFFFFFFF
-    accel.register_map.hits_2 = (hits_addr >> 32) & 0xFFFFFFFF
+  # Start accelerator (ap_start)
+  ip.write(REG_CTRL, 0x1)
 
-    accel.register_map.width = w
-    accel.register_map.height = h
+  t0 = time.time()
+  while not (ip.read(REG_CTRL) & 0x2):
+    if time.time() - t0 > timeout_s:
+      raise TimeoutError("Accelerator execution timed out.")
 
-    # Start accelerator (AP_START = 1)
-    accel.register_map.CTRL.AP_START = 1
+  # Invalidate CPU cache to fetch newly written results from DDR
+  n = ip.read(REG_RET)
+  hits_buf.sync_from_device()
 
-    # Poll for completion (AP_DONE = 1)
-    while not accel.register_map.CTRL.AP_DONE:
-        pass
-
-    # Invalidate CPU cache to read updated hits
-    hits_buf.sync_from_device()
-    n_hits = accel.register_map.ap_return
-
-    # Extract detected (x, y) coordinates
-    count = min(n_hits, MAX_HITS)
-    raw = hits_buf[:count]
-    xs = (raw & 0xFFFF).astype(int)
-    ys = ((raw >> 16) & 0xFFFF).astype(int)
-
-    return xs, ys
-
+  k = min(n, MAX_HITS)
+  v = np.array(hits_buf[:k], dtype=np.uint32)
+  return (v & 0xFFFF).astype(int), (v >> 16).astype(int), n
 
 
 def group_rects(boxes, min_neighbors=3, eps=0.2):
-    """Merges overlapping candidate boxes from multiple pyramid scales."""
-    n = len(boxes)
-    if n == 0:
-        return []
-    parent = list(range(n))
+  """Merges multi-scale overlapping boxes."""
+  n = len(boxes)
+  if n == 0:
+    return []
+  parent = list(range(n))
 
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
+  def find(i):
+    while parent[i] != i:
+      parent[i] = parent[parent[i]]
+      i = parent[i]
+    return i
 
-    def similar(a, b):
-        d = eps * (min(a[2], b[2]) + min(a[3], b[3])) * 0.5
-        return (abs(a[0] - b[0]) <= d and abs(a[1] - b[1]) <= d
-                and abs(a[0] + a[2] - b[0] - b[2]) <= d
-                and abs(a[1] + a[3] - b[1] - b[3]) <= d)
+  def similar(a, b):
+    d = eps * (min(a[2], b[2]) + min(a[3], b[3])) * 0.5
+    return (
+        abs(a[0] - b[0]) <= d
+        and abs(a[1] - b[1]) <= d
+        and abs(a[0] + a[2] - b[0] - b[2]) <= d
+        and abs(a[1] + a[3] - b[1] - b[3]) <= d
+    )
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if similar(boxes[i], boxes[j]):
-                parent[find(i)] = find(j)
+  for i in range(n):
+    for j in range(i + 1, n):
+      if similar(boxes[i], boxes[j]):
+        parent[find(i)] = find(j)
 
-    clusters = {}
-    for i in range(n):
-        clusters.setdefault(find(i), []).append(boxes[i])
+  clusters = {}
+  for i in range(n):
+    clusters.setdefault(find(i), []).append(boxes[i])
 
-    out = []
-    for members in clusters.values():
-        if len(members) >= min_neighbors:
-            m = np.mean(np.array(members, dtype=np.float64), axis=0)
-            out.append(tuple(int(round(v)) for v in m))
-    return out
+  out = []
+  for members in clusters.values():
+    if len(members) >= min_neighbors:
+      m = np.mean(np.array(members, dtype=np.float64), axis=0)
+      out.append(tuple(int(round(x)) for x in m))
+  return out
 
 
+def detect_faces(gray_320, scale=1.2, min_neighbors=3, min_size=30):
+  """Runs the multi-scale pyramid scan across hardware levels."""
+  boxes = []
+  s = 1.0
+  while gray_320.shape[0] / s >= WIN and gray_320.shape[1] / s >= WIN:
+    nh, nw = int(round(gray_320.shape[0] / s)), int(
+        round(gray_320.shape[1] / s)
+    )
+    lvl = cv2.resize(gray_320, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-# Test on a static image before testing the camera stream
-test_img = cv2.imread("test.jpg")
-if test_img is None:
-    from skimage import data
-    test_img = cv2.cvtColor(data.astronaut(), cv2.COLOR_RGB2BGR)
-
-gray_full = cv2.cvtColor(test_img, cv2.COLOR_BGR2GRAY)
-# Resize input base frame to 320x240
-gray_base = cv2.resize(gray_full, (320, 240), interpolation=cv2.INTER_LINEAR)
-
-SCALE = 1.2
-W, H = 24, 24
-candidate_boxes = []
-s = 1.0
-
-# Multi-scale image pyramid
-while gray_base.shape[0] / s >= H and gray_base.shape[1] / s >= W:
-    nh, nw = int(round(gray_base.shape[0] / s)), int(round(gray_base.shape[1] / s))
-    lvl = cv2.resize(gray_base, (nw, nh), interpolation=cv2.INTER_LINEAR)
-
-    xs, ys = run_hardware_detector(lvl)
+    xs, ys, _ = run_kernel(lvl)
     for x, y in zip(xs, ys):
-        candidate_boxes.append([int(x * s), int(y * s), int(W * s), int(H * s)])
-    s *= SCALE
+      boxes.append([int(x * s), int(y * s), int(WIN * s), int(WIN * s)])
+    s *= scale
 
-# Merge boxes
-faces = group_rects(candidate_boxes, min_neighbors=3)
-
-# Display result inside Jupyter
-result = cv2.resize(test_img, (320, 240))
-for (x, y, w, h) in faces:
-    cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-import matplotlib.pyplot as plt
-plt.figure(figsize=(8, 6))
-plt.imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-plt.axis("off")
-plt.title(f"Detected Faces: {len(faces)}")
-plt.show()
+  return [b for b in group_rects(boxes, min_neighbors) if b[2] >= min_size]
 
 
-
-
-from IPython.display import display, Image, clear_output
-
-cap = cv2.VideoCapture(0)
+# -------------------------------------------------------------------------
+# 3. Live Webcam Capture Loop
+# -------------------------------------------------------------------------
+CAM_INDEX = 0  # Change to 1 or 2 if /dev/video0 is not your USB webcam
+cap = cv2.VideoCapture(CAM_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-if not cap.isOpened():
-    raise RuntimeError("USB webcam not accessible on /dev/video0.")
+for _ in range(5):  # Let auto-exposure settle
+  cap.read()
 
-print("Starting live face detection. Stop the notebook cell to exit.")
+if not cap.isOpened():
+  raise RuntimeError(
+      f"Cannot open camera at index {CAM_INDEX}. Check `ls -l /dev/video*`."
+  )
+
+print("Accelerator running. Press 'Interrupt' (stop button) to exit.")
 
 try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+  t_prev = time.time()
+  while True:
+    ret, frame = cap.read()
+    if not ret:
+      break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        base = cv2.resize(gray, (320, 240), interpolation=cv2.INTER_LINEAR)
+    # Downsample to maximum hardware level: 320x240
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (MAX_W, MAX_H), interpolation=cv2.INTER_AREA)
 
-        candidate_boxes = []
-        s = 1.0
+    # Detect faces via PL accelerator
+    boxes = detect_faces(small)
 
-        # Scan scales
-        while base.shape[0] / s >= H and base.shape[1] / s >= W:
-            nh, nw = int(round(base.shape[0] / s)), int(round(base.shape[1] / s))
-            lvl = cv2.resize(base, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    # Scale bounding boxes up from 320x240 to 640x480 frame coordinates
+    sx, sy = frame.shape[1] / MAX_W, frame.shape[0] / MAX_H
+    for x, y, w, h in boxes:
+      cv2.rectangle(
+          frame,
+          (int(x * sx), int(y * sy)),
+          (int((x + w) * sx), int((y + h) * sy)),
+          (0, 255, 0),
+          2,
+      )
 
-            xs, ys = run_hardware_detector(lvl)
-            for x, y in zip(xs, ys):
-                # Scale coordinates back up to 640x480 webcam frame resolution
-                scale_up = 640.0 / 320.0
-                candidate_boxes.append([
-                    int(x * s * scale_up),
-                    int(y * s * scale_up),
-                    int(W * s * scale_up),
-                    int(H * s * scale_up)
-                ])
-            s *= SCALE
+    # Calculate FPS
+    t_curr = time.time()
+    fps = 1.0 / (t_curr - t_prev) if (t_curr - t_prev) > 0 else 0.0
+    t_prev = t_curr
 
-        faces = group_rects(candidate_boxes, min_neighbors=3)
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f} | Faces: {len(boxes)}",
+        (15, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2,
+    )
 
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        # Render output frame directly in Jupyter
-        _, jpeg = cv2.imencode('.jpg', frame)
-        clear_output(wait=True)
-        display(Image(data=jpeg.tobytes()))
+    # Display inside notebook
+    _, jpeg = cv2.imencode(".jpg", frame)
+    clear_output(wait=True)
+    display(Image(data=jpeg.tobytes()))
 
 except KeyboardInterrupt:
-    print("Stream stopped.")
+  print("Stream stopped by user.")
 finally:
-    cap.release()
-    img_buf.freebuffer()
-    hits_buf.freebuffer()
+  cap.release()
+  frame_buf.freebuffer()
+  hits_buf.freebuffer()
