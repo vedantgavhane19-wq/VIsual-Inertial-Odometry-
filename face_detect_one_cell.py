@@ -436,6 +436,9 @@ xs, ys, count_eq = run_kernel(small_eq)
 print(f"Raw hits (Histogram Equalized): {count_eq}")
 
 
+
+
+
 import time
 import cv2
 import numpy as np
@@ -445,11 +448,11 @@ from pynq import MMIO, Overlay, allocate
 # -------------------------------------------------------------------------
 # 1. Hardware, Overlay & Memory Allocations
 # -------------------------------------------------------------------------
-BIT_FILE  = "face_detect.bit"     # Must be in the same directory as face_detect.hwh
-CTRL_BASE = 0xA0000000            # Matches Vivado Address Editor
+BIT_FILE  = "face_detect.bit"
+CTRL_BASE = 0xA0000000
 
 MAX_W, MAX_H, MAX_HITS = 320, 240, 4096
-WIN = 24                          # Base 24x24 Haar window
+WIN = 24
 
 REG_CTRL                   = 0x00
 REG_RET                    = 0x10
@@ -565,31 +568,36 @@ def detect_faces_tuned(frame_bgr, min_neighbors=3, min_size=40):
     return [b for b in group_rects(boxes, min_neighbors=min_neighbors) if b[2] >= min_size]
 
 # -------------------------------------------------------------------------
-# 3. Live Webcam Stream Loop (No-Flicker Display Update)
+# 3. Live Webcam Stream Loop
 # -------------------------------------------------------------------------
 CAM_INDEX = 0
-cap = cv2.VideoCapture(CAM_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-for _ in range(5):
-    cap.read()
-
-if not cap.isOpened():
-    raise RuntimeError(f"Cannot access camera on /dev/video{CAM_INDEX}")
-
-TARGET_FPS = 15.0
-FRAME_BUDGET = 1.0 / TARGET_FPS
-
-# Create an initial persistent display handle in the notebook
-ret, init_frame = cap.read()
-_, init_jpeg = cv2.imencode('.jpg', init_frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-display_handle = display(Image(data=init_jpeg.tobytes()), display_id=True)
-
-print(f"Anti-Flicker Stream Active ({TARGET_FPS} FPS locked). Press Stop/Interrupt to exit.")
+cap = None
 
 try:
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot access camera on /dev/video{CAM_INDEX}")
+
+    # Warm up sensor and drain stale frames
+    for _ in range(5):
+        cap.read()
+
+    TARGET_FPS = 15.0
+    FRAME_BUDGET = 1.0 / TARGET_FPS
+
+    ret, init_frame = cap.read()
+    if not ret or init_frame is None:
+        raise RuntimeError("Failed to grab initial frame from camera.")
+
+    _, init_jpeg = cv2.imencode('.jpg', init_frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+    display_handle = display(Image(data=init_jpeg.tobytes()), display_id=True)
+
+    print(f"Stream running at {TARGET_FPS} FPS. Click Interrupt to stop.")
+
     t_prev = time.time()
     fps_smooth = TARGET_FPS
     alpha = 0.15
@@ -602,12 +610,11 @@ try:
         t_frame_start = time.time()
 
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None:
             break
 
         frame_idx += 1
 
-        # Hardware detection runs on even frames
         if frame_idx % 2 == 0 or len(active_faces) == 0:
             detected = detect_faces_tuned(frame, min_neighbors=3, min_size=40)
             if len(detected) > 0:
@@ -615,11 +622,10 @@ try:
                 missed_count = 0
             else:
                 missed_count += 1
-                if missed_count > 3:  # Hold position for up to 3 detection cycles
+                if missed_count > 3:
                     active_faces = []
                     smoothed_box = None
 
-        # Box Position Temporal Smoothing (eliminates jitter on the green box)
         if len(active_faces) > 0:
             target = active_faces[0]
             if smoothed_box is None:
@@ -631,21 +637,17 @@ try:
             bx, by, bw, bh = [int(round(v)) for v in smoothed_box]
             cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
 
-        # FPS overlay
         cv2.putText(frame, f"FPS: {fps_smooth:.1f} | Faces: {len(active_faces)}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        # In-place DOM update (prevents browser white/black repaint flashes)
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
         display_handle.update(Image(data=jpeg.tobytes()))
 
-        # Accurate Frame Time Regulation
         elapsed = time.time() - t_frame_start
         sleep_needed = FRAME_BUDGET - elapsed
         if sleep_needed > 0:
             time.sleep(sleep_needed)
 
-        # Telemetry timing
         t_curr = time.time()
         dt = t_curr - t_prev
         t_prev = t_curr
@@ -656,6 +658,7 @@ try:
 except KeyboardInterrupt:
     print("Stream stopped.")
 finally:
-    cap.release()
+    if cap is not None and cap.isOpened():
+        cap.release()
     frame_buf.freebuffer()
     hits_buf.freebuffer()
