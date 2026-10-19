@@ -434,3 +434,224 @@ small_eq = cv2.resize(
 )
 xs, ys, count_eq = run_kernel(small_eq)
 print(f"Raw hits (Histogram Equalized): {count_eq}")
+
+
+
+
+
+import time
+import cv2
+from IPython.display import Image, clear_output, display
+import numpy as np
+from pynq import MMIO, Overlay, allocate
+
+# -------------------------------------------------------------------------
+# 1. Hardware Initialization
+# -------------------------------------------------------------------------
+BIT_FILE = "face_detect.bit"  #[cite: 7]
+CTRL_BASE = 0xA0000000  #[cite: 5, 7]
+MAX_W, MAX_H, MAX_HITS = 320, 240, 4096  #[cite: 5]
+WIN = 24  #[cite: 3]
+
+REG_CTRL = 0x00  #[cite: 6]
+REG_RET = 0x10  #[cite: 6]
+REG_FRAME_LO, REG_FRAME_HI = 0x18, 0x1C  #[cite: 6]
+REG_HITS_LO, REG_HITS_HI = 0x24, 0x28  #[cite: 6]
+REG_WIDTH, REG_HEIGHT = 0x30, 0x38  #[cite: 6]
+
+ol = Overlay(BIT_FILE)
+ip = MMIO(CTRL_BASE, 0x10000)
+
+frame_buf = allocate(shape=(MAX_W * MAX_H,), dtype=np.uint8)
+hits_buf = allocate(shape=(MAX_HITS,), dtype=np.uint32)
+
+
+# -------------------------------------------------------------------------
+# 2. Kernel Driver & Multi-Scale Detection
+# -------------------------------------------------------------------------
+def run_kernel(img, timeout_s=1.5):
+  h, w = img.shape
+  if not img.flags["C_CONTIGUOUS"]:
+    img = np.ascontiguousarray(img)
+
+  frame_buf[: w * h] = img.ravel()
+  frame_buf.sync_to_device()
+
+  fa = int(frame_buf.device_address)
+  ha = int(hits_buf.device_address)
+  ip.write(REG_FRAME_LO, fa & 0xFFFFFFFF)  #[cite: 6, 7]
+  ip.write(REG_FRAME_HI, (fa >> 32) & 0xFFFFFFFF)  #[cite: 6, 7]
+  ip.write(REG_HITS_LO, ha & 0xFFFFFFFF)  #[cite: 6, 7]
+  ip.write(REG_HITS_HI, (ha >> 32) & 0xFFFFFFFF)  #[cite: 6, 7]
+  ip.write(REG_WIDTH, w)  #[cite: 6, 7]
+  ip.write(REG_HEIGHT, h)  #[cite: 6, 7]
+
+  ip.write(REG_CTRL, 0x1)  # ap_start[cite: 6, 7]
+
+  t0 = time.time()
+  while not (ip.read(REG_CTRL) & 0x2):  # ap_done[cite: 6, 7]
+    if time.time() - t0 > timeout_s:
+      return np.array([], dtype=int), np.array([], dtype=int), 0
+
+  n = ip.read(REG_RET)  #[cite: 6, 7]
+  hits_buf.sync_from_device()
+
+  k = min(n, MAX_HITS)  #[cite: 5]
+  if k == 0:
+    return np.array([], dtype=int), np.array([], dtype=int), 0
+
+  v = np.array(hits_buf[:k], dtype=np.uint32)
+  return (v & 0xFFFF).astype(int), (v >> 16).astype(int), n  #[cite: 5, 7]
+
+
+def group_rects(boxes, min_neighbors=2, eps=0.3):
+  """Fast bounding box merging with relaxed clustering for webcam feeds."""
+  n = len(boxes)
+  if n == 0:
+    return []
+  parent = list(range(n))
+
+  def find(i):
+    while parent[i] != i:
+      parent[i] = parent[parent[i]]
+      i = parent[i]
+    return i
+
+  def similar(a, b):
+    d = eps * (min(a[2], b[2]) + min(a[3], b[3])) * 0.5
+    return (
+        abs(a[0] - b[0]) <= d
+        and abs(a[1] - b[1]) <= d
+        and abs(a[0] + a[2] - b[0] - b[2]) <= d
+        and abs(a[1] + a[3] - b[1] - b[3]) <= d
+    )
+
+  for i in range(n):
+    for j in range(i + 1, n):
+      if similar(boxes[i], boxes[j]):
+        parent[find(i)] = find(j)
+
+  clusters = {}
+  for i in range(n):
+    clusters.setdefault(find(i), []).append(boxes[i])
+
+  out = []
+  for members in clusters.values():
+    if len(members) >= min_neighbors:
+      m = np.mean(np.array(members, dtype=np.float64), axis=0)
+      out.append(tuple(int(round(x)) for x in m))
+  return out
+
+
+def detect_faces(gray_320, scale=1.15, min_neighbors=2, min_size=36):
+  """Evaluates 4 targeted pyramid scales around standard face sizes."""
+  boxes = []
+  raw_points = []
+  s = 1.0
+
+  # Evaluate up to 4 pyramid levels (covers face sizes 36px to ~160px)
+  for _ in range(4):
+    nw = int(round(320 / s))
+    nh = int(round(240 / s))
+    if nw < WIN or nh < WIN:
+      break
+
+    lvl = cv2.resize(gray_320, (nw, nh), interpolation=cv2.INTER_NEAREST)
+    xs, ys, count = run_kernel(lvl)
+
+    for x, y in zip(xs, ys):
+      orig_x = int(x * s)
+      orig_y = int(y * s)
+      box_dim = int(WIN * s)
+      raw_points.append((orig_x, orig_y))
+      boxes.append([orig_x, orig_y, box_dim, box_dim])
+
+    s *= scale
+
+  faces = [
+      b for b in group_rects(boxes, min_neighbors=min_neighbors) if b[2] >= min_size
+  ]
+  return faces, raw_points
+
+
+# -------------------------------------------------------------------------
+# 3. Execution Loop
+# -------------------------------------------------------------------------
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+for _ in range(5):
+  cap.read()
+
+print("Face Detector Running. Adjust your distance to camera.")
+
+try:
+  t_prev = time.time()
+  fps_smooth = 0.0
+  alpha = 0.2
+  frame_count = 0
+  faces = []
+  raw_pts = []
+
+  while True:
+    ret, frame = cap.read()
+    if not ret:
+      break
+
+    frame_count += 1
+
+    # Run inference every frame to avoid skipping latency
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (MAX_W, MAX_H), interpolation=cv2.INTER_NEAREST)
+
+    faces, raw_pts = detect_faces(
+        small, scale=1.15, min_neighbors=2, min_size=36
+    )
+
+    # Scale coordinates back to 640x480 frame
+    sx = frame.shape[1] / MAX_W
+    sy = frame.shape[0] / MAX_H
+
+    # 1. Draw raw hardware hits (Blue dots) to confirm PL triggers
+    for rx, ry in raw_pts:
+      cv2.circle(frame, (int(rx * sx), int(ry * sy)), 2, (255, 0, 0), -1)
+
+    # 2. Draw clustered face boxes (Green boxes)
+    for x, y, w, h in faces:
+      cv2.rectangle(
+          frame,
+          (int(x * sx), int(y * sy)),
+          (int((x + w) * sx), int((y + h) * sy)),
+          (0, 255, 0),
+          2,
+      )
+
+    t_curr = time.time()
+    dt = t_curr - t_prev
+    t_prev = t_curr
+    if dt > 0:
+      fps_smooth = (1.0 / dt) if fps_smooth == 0.0 else (alpha * (1.0 / dt) + (1.0 - alpha) * fps_smooth)
+
+    cv2.putText(
+        frame,
+        f"FPS: {fps_smooth:.1f} | Faces: {len(faces)} | Raw Hits: {len(raw_pts)}",
+        (15, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2,
+    )
+
+    # Display in Jupyter
+    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+    clear_output(wait=True)
+    display(Image(data=jpeg.tobytes()))
+
+except KeyboardInterrupt:
+  print("Stream stopped.")
+finally:
+  cap.release()
+  frame_buf.freebuffer()
+  hits_buf.freebuffer()
