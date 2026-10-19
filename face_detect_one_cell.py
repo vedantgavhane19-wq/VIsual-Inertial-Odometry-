@@ -104,57 +104,80 @@ def group_rects(boxes, min_neighbors=3, eps=0.2):
   return out
 
 
-def detect_faces(gray_320, scale=1.2, min_neighbors=3, min_size=30):
-  """Runs the multi-scale pyramid scan across hardware levels."""
+# Updated detection parameters for speed and accuracy
+def detect_faces_fast(
+    gray_320, scale=1.25, min_neighbors=5, min_size=50, max_levels=6
+):
+  """scale=1.25: Reduces pyramid levels from ~13 down to ~5-6 passes.
+
+  min_neighbors=5: Filters out noise/false positives (like the window/wall).
+  min_size=50: Skips excessively small sub-windows.
+  max_levels=6: Caps the search depth.
+  """
   boxes = []
   s = 1.0
-  while gray_320.shape[0] / s >= WIN and gray_320.shape[1] / s >= WIN:
-    nh, nw = int(round(gray_320.shape[0] / s)), int(
-        round(gray_320.shape[1] / s)
-    )
+  lvl_count = 0
+
+  while (
+      gray_320.shape[0] / s >= WIN
+      and gray_320.shape[1] / s >= WIN
+      and lvl_count < max_levels
+  ):
+    nh, nw = int(round(gray_320.shape[0] / s)), int(round(gray_320.shape[1] / s))
     lvl = cv2.resize(gray_320, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
     xs, ys, _ = run_kernel(lvl)
     for x, y in zip(xs, ys):
       boxes.append([int(x * s), int(y * s), int(WIN * s), int(WIN * s)])
-    s *= scale
 
-  return [b for b in group_rects(boxes, min_neighbors) if b[2] >= min_size]
+    s *= scale
+    lvl_count += 1
+
+  return [b for b in group_rects(boxes, min_neighbors=min_neighbors) if b[2] >= min_size]
 
 
 # -------------------------------------------------------------------------
 # 3. Live Webcam Capture Loop
 # -------------------------------------------------------------------------
-CAM_INDEX = 0  # Change to 1 or 2 if /dev/video0 is not your USB webcam
+# Replace Section 3 in your single cell with this optimized loop:
+CAM_INDEX = 0
 cap = cv2.VideoCapture(CAM_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-for _ in range(5):  # Let auto-exposure settle
+# Optional: set camera backend buffer size to avoid frame queuing delay
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+for _ in range(5):
   cap.read()
 
 if not cap.isOpened():
-  raise RuntimeError(
-      f"Cannot open camera at index {CAM_INDEX}. Check `ls -l /dev/video*`."
-  )
+  raise RuntimeError(f"Cannot open camera at index {CAM_INDEX}")
 
-print("Accelerator running. Press 'Interrupt' (stop button) to exit.")
+print("Fast Detection Running. Press 'Interrupt' to stop.")
 
 try:
   t_prev = time.time()
+  frame_count = 0
+  boxes = []
+
   while True:
     ret, frame = cap.read()
     if not ret:
       break
 
-    # Downsample to maximum hardware level: 320x240
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    small = cv2.resize(gray, (MAX_W, MAX_H), interpolation=cv2.INTER_AREA)
+    frame_count += 1
 
-    # Detect faces via PL accelerator
-    boxes = detect_faces(small)
+    # Run detection only on every 2nd frame to boost effective frame rate
+    if frame_count % 2 == 0 or len(boxes) == 0:
+      gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+      small = cv2.resize(gray, (MAX_W, MAX_H), interpolation=cv2.INTER_NEAREST)
+      # Use the optimized fast detector
+      boxes = detect_faces_fast(
+          small, scale=1.25, min_neighbors=5, min_size=50, max_levels=6
+      )
 
-    # Scale bounding boxes up from 320x240 to 640x480 frame coordinates
+    # Draw boxes
     sx, sy = frame.shape[1] / MAX_W, frame.shape[0] / MAX_H
     for x, y, w, h in boxes:
       cv2.rectangle(
@@ -180,10 +203,11 @@ try:
         2,
     )
 
-    # Display inside notebook
-    _, jpeg = cv2.imencode(".jpg", frame)
-    clear_output(wait=True)
-    display(Image(data=jpeg.tobytes()))
+    # Render only every 2nd display cycle to reduce Jupyter HTTP overhead
+    if frame_count % 2 == 0:
+      _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+      clear_output(wait=True)
+      display(Image(data=jpeg.tobytes()))
 
 except KeyboardInterrupt:
   print("Stream stopped by user.")
