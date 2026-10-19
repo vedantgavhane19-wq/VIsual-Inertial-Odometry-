@@ -222,33 +222,35 @@ finally:
 import time
 import cv2
 import numpy as np
-from IPython.display import clear_output, Image, display
+from IPython.display import Image, clear_output, display
+
+# Base 24x24 Haar window size defined by the cascade
+WIN = 24
 
 # -------------------------------------------------------------------------
-# Targeted Fast Multi-Scale Search
+# Fast Multi-Scale Face Detector
 # -------------------------------------------------------------------------
 def detect_faces_tuned(frame_bgr, min_neighbors=4, min_size=40):
-    # Base search at 240x180 cuts initial hardware window evaluations in half
     BASE_W, BASE_H = 240, 180
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     base = cv2.resize(gray, (BASE_W, BASE_H), interpolation=cv2.INTER_LINEAR)
     
-    # 4 targeted scale factors (covers near, medium, and far faces)
+    # 4 targeted scale steps to balance speed and accuracy
     SCALES = [1.0, 1.35, 1.8, 2.4]
-    
     boxes = []
     
     for s in SCALES:
         nw = int(round(BASE_W / s))
         nh = int(round(BASE_H / s))
         
+        # Stop if the image level becomes smaller than the 24x24 detector window
         if nw < WIN or nh < WIN:
             break
             
         lvl = cv2.resize(base, (nw, nh), interpolation=cv2.INTER_NEAREST)
         xs, ys, n = run_kernel(lvl)
         
-        # Scale back to original frame (640x480)
+        # Project normalized coordinates back to the original 640x480 frame
         norm_x = (640.0 / BASE_W) * s
         norm_y = (480.0 / BASE_H) * s
         
@@ -263,7 +265,7 @@ def detect_faces_tuned(frame_bgr, min_neighbors=4, min_size=40):
     return [b for b in group_rects(boxes, min_neighbors=min_neighbors) if b[2] >= min_size]
 
 # -------------------------------------------------------------------------
-# Live Loop with Frame Decoupling
+# Video Capture Stream
 # -------------------------------------------------------------------------
 CAM_INDEX = 0
 cap = cv2.VideoCapture(CAM_INDEX)
@@ -271,7 +273,13 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-print("Running optimized pipeline. Press Stop/Interrupt to exit.")
+for _ in range(5):
+    cap.read()
+
+if not cap.isOpened():
+    raise RuntimeError(f"Cannot access camera on /dev/video{CAM_INDEX}")
+
+print("Detector running with WIN = 24. Press Stop/Interrupt to exit.")
 
 try:
     t_prev = time.time()
@@ -285,11 +293,10 @@ try:
             
         frame_idx += 1
         
-        # Run detection every 2nd frame; keep previous boxes on intermediate frames
+        # Run detection on every 2nd frame
         if frame_idx % 2 == 0 or len(active_faces) == 0:
             active_faces = detect_faces_tuned(frame, min_neighbors=4, min_size=40)
             
-        # Draw bounding boxes
         for (x, y, w, h) in active_faces:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
@@ -300,7 +307,6 @@ try:
         cv2.putText(frame, f"FPS: {fps:.1f} | Faces: {len(active_faces)}", 
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        # Display image
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
         clear_output(wait=True)
         display(Image(data=jpeg.tobytes()))
