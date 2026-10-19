@@ -215,3 +215,97 @@ finally:
   cap.release()
   frame_buf.freebuffer()
   hits_buf.freebuffer()
+
+
+
+
+import time
+import cv2
+import numpy as np
+from IPython.display import clear_output, Image, display
+
+# -------------------------------------------------------------------------
+# Targeted Fast Multi-Scale Search
+# -------------------------------------------------------------------------
+def detect_faces_tuned(frame_bgr, min_neighbors=4, min_size=40):
+    # Base search at 240x180 cuts initial hardware window evaluations in half
+    BASE_W, BASE_H = 240, 180
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    base = cv2.resize(gray, (BASE_W, BASE_H), interpolation=cv2.INTER_LINEAR)
+    
+    # 4 targeted scale factors (covers near, medium, and far faces)
+    SCALES = [1.0, 1.35, 1.8, 2.4]
+    
+    boxes = []
+    
+    for s in SCALES:
+        nw = int(round(BASE_W / s))
+        nh = int(round(BASE_H / s))
+        
+        if nw < WIN or nh < WIN:
+            break
+            
+        lvl = cv2.resize(base, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        xs, ys, n = run_kernel(lvl)
+        
+        # Scale back to original frame (640x480)
+        norm_x = (640.0 / BASE_W) * s
+        norm_y = (480.0 / BASE_H) * s
+        
+        for x, y in zip(xs, ys):
+            boxes.append([
+                int(x * norm_x),
+                int(y * norm_y),
+                int(WIN * norm_x),
+                int(WIN * norm_y)
+            ])
+            
+    return [b for b in group_rects(boxes, min_neighbors=min_neighbors) if b[2] >= min_size]
+
+# -------------------------------------------------------------------------
+# Live Loop with Frame Decoupling
+# -------------------------------------------------------------------------
+CAM_INDEX = 0
+cap = cv2.VideoCapture(CAM_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+print("Running optimized pipeline. Press Stop/Interrupt to exit.")
+
+try:
+    t_prev = time.time()
+    frame_idx = 0
+    active_faces = []
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        frame_idx += 1
+        
+        # Run detection every 2nd frame; keep previous boxes on intermediate frames
+        if frame_idx % 2 == 0 or len(active_faces) == 0:
+            active_faces = detect_faces_tuned(frame, min_neighbors=4, min_size=40)
+            
+        # Draw bounding boxes
+        for (x, y, w, h) in active_faces:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+        t_curr = time.time()
+        fps = 1.0 / (t_curr - t_prev) if (t_curr - t_prev) > 0 else 0.0
+        t_prev = t_curr
+        
+        cv2.putText(frame, f"FPS: {fps:.1f} | Faces: {len(active_faces)}", 
+                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Display image
+        _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        clear_output(wait=True)
+        display(Image(data=jpeg.tobytes()))
+        
+except KeyboardInterrupt:
+    print("Stream stopped.")
+finally:
+    cap.release()
