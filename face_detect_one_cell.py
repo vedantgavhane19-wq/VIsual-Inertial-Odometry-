@@ -219,41 +219,134 @@ finally:
 
 
 
+
+
 import time
 import cv2
 import numpy as np
 from IPython.display import Image, clear_output, display
-
-# Base 24x24 Haar window size defined by the cascade
-WIN = 24
+from pynq import MMIO, Overlay, allocate
 
 # -------------------------------------------------------------------------
-# Fast Multi-Scale Face Detector
+# 1. Hardware, Overlay & Memory Allocations
 # -------------------------------------------------------------------------
+BIT_FILE  = "face_detect.bit"     # Must be in the same folder as face_detect.hwh
+CTRL_BASE = 0xA0000000            # Matches Vivado Address Editor
+
+MAX_W, MAX_H, MAX_HITS = 320, 240, 4096
+WIN = 24                          # Base 24x24 Haar window size
+
+# Register offsets (from HLS hardware handoff)
+REG_CTRL                   = 0x00
+REG_RET                    = 0x10
+REG_FRAME_LO, REG_FRAME_HI = 0x18, 0x1C
+REG_HITS_LO,  REG_HITS_HI  = 0x24, 0x28
+REG_WIDTH,    REG_HEIGHT   = 0x30, 0x38
+
+# Load bitstream & memory map
+ol = Overlay(BIT_FILE)
+ip = MMIO(CTRL_BASE, 0x10000)
+
+# Allocate physically contiguous DMA buffers
+frame_buf = allocate(shape=(MAX_W * MAX_H,), dtype=np.uint8)
+hits_buf  = allocate(shape=(MAX_HITS,),      dtype=np.uint32)
+
+# -------------------------------------------------------------------------
+# 2. Hardware Driver & Clustering Helpers
+# -------------------------------------------------------------------------
+def run_kernel(img, timeout_s=3.0):
+    """Executes the FPGA face_detect IP core on one grayscale image level."""
+    h, w = img.shape
+
+    # Transfer image data to DDR and flush CPU cache
+    frame_buf[: w * h] = img.ravel()
+    frame_buf.sync_to_device()
+
+    # Pass 64-bit physical memory addresses & dimensions
+    fa = int(frame_buf.device_address)
+    ha = int(hits_buf.device_address)
+    ip.write(REG_FRAME_LO, fa & 0xFFFFFFFF)
+    ip.write(REG_FRAME_HI, fa >> 32)
+    ip.write(REG_HITS_LO,  ha & 0xFFFFFFFF)
+    ip.write(REG_HITS_HI,  ha >> 32)
+    ip.write(REG_WIDTH,  w)
+    ip.write(REG_HEIGHT, h)
+
+    # Start accelerator (ap_start = bit 0)
+    ip.write(REG_CTRL, 0x1)
+
+    t0 = time.time()
+    while not (ip.read(REG_CTRL) & 0x2):
+        if time.time() - t0 > timeout_s:
+            raise TimeoutError("Accelerator execution timed out.")
+
+    # Read back hit count & sync CPU cache
+    n = ip.read(REG_RET)
+    hits_buf.sync_from_device()
+
+    k = min(n, MAX_HITS)
+    v = np.array(hits_buf[:k], dtype=np.uint32)
+    return (v & 0xFFFF).astype(int), (v >> 16).astype(int), n
+
+
+def group_rects(boxes, min_neighbors=4, eps=0.2):
+    """Merges candidate bounding boxes across pyramid scales."""
+    n = len(boxes)
+    if n == 0:
+        return []
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def similar(a, b):
+        d = eps * (min(a[2], b[2]) + min(a[3], b[3])) * 0.5
+        return (abs(a[0] - b[0]) <= d and abs(a[1] - b[1]) <= d
+                and abs(a[0] + a[2] - b[0] - b[2]) <= d
+                and abs(a[1] + a[3] - b[1] - b[3]) <= d)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if similar(boxes[i], boxes[j]):
+                parent[find(i)] = find(j)
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(boxes[i])
+
+    out = []
+    for members in clusters.values():
+        if len(members) >= min_neighbors:
+            m = np.mean(np.array(members, dtype=np.float64), axis=0)
+            out.append(tuple(int(round(x)) for x in m))
+    return out
+
+
 def detect_faces_tuned(frame_bgr, min_neighbors=4, min_size=40):
+    """Fast multi-scale scan using 4 targeted resolution steps."""
     BASE_W, BASE_H = 240, 180
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     base = cv2.resize(gray, (BASE_W, BASE_H), interpolation=cv2.INTER_LINEAR)
-    
-    # 4 targeted scale steps to balance speed and accuracy
+
     SCALES = [1.0, 1.35, 1.8, 2.4]
     boxes = []
-    
+
     for s in SCALES:
         nw = int(round(BASE_W / s))
         nh = int(round(BASE_H / s))
-        
-        # Stop if the image level becomes smaller than the 24x24 detector window
+
         if nw < WIN or nh < WIN:
             break
-            
+
         lvl = cv2.resize(base, (nw, nh), interpolation=cv2.INTER_NEAREST)
         xs, ys, n = run_kernel(lvl)
-        
-        # Project normalized coordinates back to the original 640x480 frame
+
         norm_x = (640.0 / BASE_W) * s
         norm_y = (480.0 / BASE_H) * s
-        
+
         for x, y in zip(xs, ys):
             boxes.append([
                 int(x * norm_x),
@@ -261,11 +354,11 @@ def detect_faces_tuned(frame_bgr, min_neighbors=4, min_size=40):
                 int(WIN * norm_x),
                 int(WIN * norm_y)
             ])
-            
+
     return [b for b in group_rects(boxes, min_neighbors=min_neighbors) if b[2] >= min_size]
 
 # -------------------------------------------------------------------------
-# Video Capture Stream
+# 3. Live Webcam Stream Loop
 # -------------------------------------------------------------------------
 CAM_INDEX = 0
 cap = cv2.VideoCapture(CAM_INDEX)
@@ -279,39 +372,41 @@ for _ in range(5):
 if not cap.isOpened():
     raise RuntimeError(f"Cannot access camera on /dev/video{CAM_INDEX}")
 
-print("Detector running with WIN = 24. Press Stop/Interrupt to exit.")
+print("Detector running. Press Stop/Interrupt to exit.")
 
 try:
     t_prev = time.time()
     frame_idx = 0
     active_faces = []
-    
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         frame_idx += 1
-        
-        # Run detection on every 2nd frame
+
+        # Detect every 2nd frame; keep previous tracking on odd frames
         if frame_idx % 2 == 0 or len(active_faces) == 0:
             active_faces = detect_faces_tuned(frame, min_neighbors=4, min_size=40)
-            
+
         for (x, y, w, h) in active_faces:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
+
         t_curr = time.time()
         fps = 1.0 / (t_curr - t_prev) if (t_curr - t_prev) > 0 else 0.0
         t_prev = t_curr
-        
-        cv2.putText(frame, f"FPS: {fps:.1f} | Faces: {len(active_faces)}", 
+
+        cv2.putText(frame, f"FPS: {fps:.1f} | Faces: {len(active_faces)}",
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
+
         _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
         clear_output(wait=True)
         display(Image(data=jpeg.tobytes()))
-        
+
 except KeyboardInterrupt:
     print("Stream stopped.")
 finally:
     cap.release()
+    frame_buf.freebuffer()
+    hits_buf.freebuffer()
