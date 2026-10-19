@@ -436,8 +436,6 @@ xs, ys, count_eq = run_kernel(small_eq)
 print(f"Raw hits (Histogram Equalized): {count_eq}")
 
 
-
-
 import time
 import cv2
 import numpy as np
@@ -447,17 +445,17 @@ from pynq import MMIO, Overlay, allocate
 # -------------------------------------------------------------------------
 # 1. Hardware, Overlay & Memory Allocations
 # -------------------------------------------------------------------------
-BIT_FILE  = "face_detect.bit"     # Must be in the same directory as face_detect.hwh[cite: 7]
-CTRL_BASE = 0xA0000000            # Matches Vivado Address Editor[cite: 5, 7]
+BIT_FILE  = "face_detect.bit"     # Must be in the same directory as face_detect.hwh
+CTRL_BASE = 0xA0000000            # Matches Vivado Address Editor
 
-MAX_W, MAX_H, MAX_HITS = 320, 240, 4096[cite: 5]
-WIN = 24                          # Base 24x24 Haar window[cite: 3]
+MAX_W, MAX_H, MAX_HITS = 320, 240, 4096
+WIN = 24                          # Base 24x24 Haar window
 
-REG_CTRL                   = 0x00[cite: 6]
-REG_RET                    = 0x10[cite: 6]
-REG_FRAME_LO, REG_FRAME_HI = 0x18, 0x1C[cite: 6]
-REG_HITS_LO,  REG_HITS_HI  = 0x24, 0x28[cite: 6]
-REG_WIDTH,    REG_HEIGHT   = 0x30, 0x38[cite: 6]
+REG_CTRL                   = 0x00
+REG_RET                    = 0x10
+REG_FRAME_LO, REG_FRAME_HI = 0x18, 0x1C
+REG_HITS_LO,  REG_HITS_HI  = 0x24, 0x28
+REG_WIDTH,    REG_HEIGHT   = 0x30, 0x38
 
 ol = Overlay(BIT_FILE)
 ip = MMIO(CTRL_BASE, 0x10000)
@@ -478,26 +476,26 @@ def run_kernel(img, timeout_s=3.0):
 
     fa = int(frame_buf.device_address)
     ha = int(hits_buf.device_address)
-    ip.write(REG_FRAME_LO, fa & 0xFFFFFFFF)[cite: 6, 7]
-    ip.write(REG_FRAME_HI, (fa >> 32) & 0xFFFFFFFF)[cite: 6, 7]
-    ip.write(REG_HITS_LO,  ha & 0xFFFFFFFF)[cite: 6, 7]
-    ip.write(REG_HITS_HI,  (ha >> 32) & 0xFFFFFFFF)[cite: 6, 7]
-    ip.write(REG_WIDTH,    w)[cite: 6, 7]
-    ip.write(REG_HEIGHT,   h)[cite: 6, 7]
+    ip.write(REG_FRAME_LO, fa & 0xFFFFFFFF)
+    ip.write(REG_FRAME_HI, (fa >> 32) & 0xFFFFFFFF)
+    ip.write(REG_HITS_LO,  ha & 0xFFFFFFFF)
+    ip.write(REG_HITS_HI,  (ha >> 32) & 0xFFFFFFFF)
+    ip.write(REG_WIDTH,    w)
+    ip.write(REG_HEIGHT,   h)
 
-    ip.write(REG_CTRL, 0x1)[cite: 6]
+    ip.write(REG_CTRL, 0x1)
 
     t0 = time.time()
-    while not (ip.read(REG_CTRL) & 0x2):[cite: 6]
+    while not (ip.read(REG_CTRL) & 0x2):
         if time.time() - t0 > timeout_s:
             raise TimeoutError("Accelerator execution timed out.")
 
-    n = ip.read(REG_RET)[cite: 6]
+    n = ip.read(REG_RET)
     hits_buf.sync_from_device()
 
-    k = min(n, MAX_HITS)[cite: 5]
+    k = min(n, MAX_HITS)
     v = np.array(hits_buf[:k], dtype=np.uint32)
-    return (v & 0xFFFF).astype(int), (v >> 16).astype(int), n[cite: 5, 7]
+    return (v & 0xFFFF).astype(int), (v >> 16).astype(int), n
 
 
 def group_rects(boxes, min_neighbors=3, eps=0.25):
@@ -627,7 +625,6 @@ try:
             if smoothed_box is None:
                 smoothed_box = list(target)
             else:
-                # Interpolate 40% towards the new target
                 for i in range(4):
                     smoothed_box[i] = smoothed_box[i] * 0.6 + target[i] * 0.4
 
