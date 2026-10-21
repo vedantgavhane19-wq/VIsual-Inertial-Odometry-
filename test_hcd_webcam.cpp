@@ -76,22 +76,21 @@ int main() {
     }
 
     // 3. Open AXI registers via /dev/mem (O_SYNC is required for MMIO)
-    std::cout << "[2] Opening AXI Registers via /dev/mem...\n";
-    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (mem_fd < 0) {
-        perror("Error opening /dev/mem (must run with sudo)");
-        munmap(shared_mem, total_bytes);
-        close(udma_fd);
-        return -1;
-    }
-    volatile uint32_t* axi = (volatile uint32_t*)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0xB0000000);
-    if (axi == MAP_FAILED) {
-        perror("Error mmap AXI registers");
-        close(mem_fd);
-        munmap(shared_mem, total_bytes);
-        close(udma_fd);
-        return -1;
-    }
+    std::cout << "[3] Writing AXI configuration...\n";
+    
+    // Pointer 1: img_in (64-bit)
+    axi[0x10 / 4] = (uint32_t)(phys_in & 0xFFFFFFFF);
+    axi[0x14 / 4] = (uint32_t)(phys_in >> 32);
+
+    // Pointer 2: img_out (64-bit) -> starts at 0x18, NOT 0x1C
+    axi[0x18 / 4] = (uint32_t)((phys_in + frame_bytes) & 0xFFFFFFFF);
+    axi[0x1C / 4] = (uint32_t)((phys_in + frame_bytes) >> 32);
+
+    // Scalar arguments (each 32-bit scalar occupies 4 or 8 bytes)
+    axi[0x20 / 4] = height;      // rows
+    axi[0x24 / 4] = width;       // cols
+    axi[0x28 / 4] = 5;           // threshold (lowered to detect contrast)
+    axi[0x2C / 4] = 2621;        // k parameter
 
     // 4. Configure AXI Core Registers
     std::cout << "[3] Writing AXI configuration...\n";
