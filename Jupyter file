@@ -1,143 +1,198 @@
-import time
-import cv2
-import numpy as np
-import ipywidgets as widgets
-from IPython.display import display
-from pynq import Overlay, allocate
+#include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <string.h>
+#include <chrono>
+#include <opencv2/opencv.hpp>
 
-# 1. Overlay & Register Map Setup
-ol = Overlay("design_1_wrapper.bit")
-ip = ol.corner_harris_accel_0
+// Helper to configure u-dma-buf cache synchronization parameters in sysfs
+bool setup_udmabuf_sync(size_t buffer_size) {
+    FILE* f_sz = fopen("/sys/class/u-dma-buf/udmabuf0/sync_size", "w");
+    if (!f_sz) return false;
+    fprintf(f_sz, "%zu\n", buffer_size);
+    fclose(f_sz);
 
-CTRL, SRC_LO, SRC_HI, DST_LO, DST_HI = 0x00, 0x10, 0x14, 0x1C, 0x20
-ROWS, COLS, THRESH, K_SCALE          = 0x28, 0x30, 0x38, 0x40
-AP_START, AP_DONE                    = 0x1, 0x2
+    FILE* f_dir = fopen("/sys/class/u-dma-buf/udmabuf0/sync_direction", "w");
+    if (!f_dir) return false;
+    fprintf(f_dir, "3\n"); // 3 = DMA_BIDIRECTIONAL
+    fclose(f_dir);
 
-WIDTH, HEIGHT = 480, 320
-THRESHOLD     = 1500
-K_SCALED      = 2621
-MAX_DRAW      = 1000
+    FILE* f_off = fopen("/sys/class/u-dma-buf/udmabuf0/sync_offset", "w");
+    if (!f_off) return false;
+    fprintf(f_off, "0\n");
+    fclose(f_off);
 
-in_buf  = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
-out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+    return true;
+}
 
-def write64(lo, hi, value):
-    ip.write(lo, value & 0xFFFFFFFF)
-    ip.write(hi, (value >> 32) & 0xFFFFFFFF)
+int main() {
+    const int WIDTH = 480;
+    const int HEIGHT = 320;
+    const size_t frame_bytes = WIDTH * HEIGHT;
+    const size_t total_bytes = frame_bytes * 2;
+    const int THRESHOLD = 1500;  // Matches working PYNQ configuration
+    const int K_SCALED  = 2621;  // Matches working PYNQ configuration
 
-write64(SRC_LO, SRC_HI, in_buf.physical_address)
-write64(DST_LO, DST_HI, out_buf.physical_address)
-ip.write(ROWS, HEIGHT)
-ip.write(COLS, WIDTH)
-ip.write(THRESH, THRESHOLD)
-ip.write(K_SCALE, K_SCALED)
+    // 1. Read Physical DMA Address
+    uint64_t phys_in = 0;
+    FILE* f_addr = fopen("/sys/class/u-dma-buf/udmabuf0/phys_addr", "r");
+    if (!f_addr || fscanf(f_addr, "%lx", &phys_in) != 1) {
+        std::cerr << "Error: Cannot read udmabuf0 phys_addr. Is the bitstream loaded?\n";
+        if (f_addr) fclose(f_addr);
+        return -1;
+    }
+    fclose(f_addr);
+    std::cout << "[0] FPGA Physical DMA Base: 0x" << std::hex << phys_in << std::dec << "\n";
 
-def run_ip(timeout=1.0):
-    ip.write(CTRL, AP_START)
-    t0 = time.time()
-    while not (ip.read(CTRL) & AP_DONE):
-        if time.time() - t0 > timeout:
-            raise TimeoutError(f"IP timeout, CTRL=0x{ip.read(CTRL):02x}")
+    // Configure u-dma-buf cache range before mapping
+    if (!setup_udmabuf_sync(total_bytes)) {
+        std::cerr << "Warning: Could not configure udmabuf sync sysfs parameters.\n";
+    }
 
-# 2. Benchmarking Routines
-def process_pl(gray):
-    np.copyto(in_buf, gray)
-    
-    # 1. Total System Round-Trip Start
-    t_system_start = time.perf_counter()
-    
-    in_buf.flush()
-    out_buf[:] = 0
-    out_buf.flush()
-    
-   # --- PURE IP EXECUTION START ---
-    t_ip_start = time.perf_counter()
-    
-    ip.write(CTRL, AP_START)
-    while not (ip.read(CTRL) & AP_DONE):
-        pass  # Waiting for hardware
-        
-    t_ip_end = time.perf_counter()
-    # --- PURE IP EXECUTION END ---
-    
-    out_buf.invalidate()
-    
-    t_system_end = time.perf_counter()
-    
-    # 2. Calculate Latencies in Milliseconds
-    total_pl_ms = (t_system_end - t_system_start) * 1000.0
-    pure_ip_ms = (t_ip_end - t_ip_start) * 1000.0
-    
-    # 3. Calculate Clock Cycles (Assuming 200 MHz pl_clk0)
-    clock_freq_hz = 200_000_000  
-    pure_ip_seconds = (t_ip_end - t_ip_start)
-    estimated_cycles = int(pure_ip_seconds * clock_freq_hz)
-    
-    # Print it to the console once every 30 frames to avoid spamming
-    if hasattr(process_pl, "counter"):
-        process_pl.counter += 1
-        if process_pl.counter % 30 == 0:
-            print(f"Pure IP Latency: {pure_ip_ms:.2f} ms | Hardware Cycles: {estimated_cycles:,}")
-    else:
-        process_pl.counter = 1
-    
-    return np.array(out_buf), total_pl_ms
+    // 2. Map udmabuf0 for DMA buffers
+    int udma_fd = open("/dev/udmabuf0", O_RDWR);
+    if (udma_fd < 0) {
+        perror("Failed to open /dev/udmabuf0");
+        return -1;
+    }
+    uint8_t* shared_mem = (uint8_t*)mmap(NULL, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, udma_fd, 0);
+    if (shared_mem == MAP_FAILED) {
+        perror("Failed to mmap udmabuf0");
+        close(udma_fd);
+        return -1;
+    }
+    uint8_t* in_buf  = shared_mem;
+    uint8_t* out_buf = shared_mem + frame_bytes;
 
-def process_ps(gray):
-    t_start = time.perf_counter()
-    dst = cv2.cornerHarris(gray, blockSize=3, ksize=3, k=0.04)
-    t_end = time.perf_counter()
-    return dst, (t_end - t_start) * 1000.0
+    // 3. Map AXI Slave Control Registers via /dev/mem
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd < 0) {
+        perror("Failed to open /dev/mem (run with sudo)");
+        munmap(shared_mem, total_bytes);
+        close(udma_fd);
+        return -1;
+    }
+    volatile uint32_t* axi = (volatile uint32_t*)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0xB0000000);
+    if (axi == MAP_FAILED) {
+        perror("Failed to mmap AXI control registers");
+        close(mem_fd);
+        munmap(shared_mem, total_bytes);
+        close(udma_fd);
+        return -1;
+    }
 
-# 3. Execution & Visualization
-image_widget = widgets.Image(format='jpeg', width=WIDTH, height=HEIGHT)
-display(image_widget)
+    // 4. Configure AXI Core Registers (Exact offsets from your PYNQ setup)
+    uint64_t phys_out = phys_in + frame_bytes;
+    axi[0x10 / 4] = (uint32_t)(phys_in & 0xFFFFFFFF);        // SRC_LO
+    axi[0x14 / 4] = (uint32_t)((phys_in >> 32) & 0xFFFFFFFF); // SRC_HI
+    axi[0x1C / 4] = (uint32_t)(phys_out & 0xFFFFFFFF);       // DST_LO
+    axi[0x20 / 4] = (uint32_t)((phys_out >> 32) & 0xFFFFFFFF);// DST_HI
+    axi[0x28 / 4] = HEIGHT;                                   // ROWS
+    axi[0x30 / 4] = WIDTH;                                    // COLS
+    axi[0x38 / 4] = THRESHOLD;                                // THRESH (1500)
+    axi[0x40 / 4] = K_SCALED;                                 // K_SCALE (2621)
 
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    // Verification Readback
+    std::cout << "[1] AXI Configuration Applied:\n"
+              << "    - SRC Physical: 0x" << std::hex << ((uint64_t)axi[0x14/4] << 32 | axi[0x10/4]) << "\n"
+              << "    - DST Physical: 0x" << ((uint64_t)axi[0x20/4] << 32 | axi[0x1C/4]) << std::dec << "\n"
+              << "    - Dimensions  : " << axi[0x30/4] << " x " << axi[0x28/4] << "\n"
+              << "    - Threshold   : " << axi[0x38/4] << " | K: " << axi[0x40/4] << "\n";
 
-try:
-    fps_start = time.time()
-    frames = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
-            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+    // 5. Open Webcam
+    std::cout << "[2] Capturing test frame from webcam...\n";
+    cv::VideoCapture cap(0, cv::CAP_V4L2);
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, WIDTH);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, HEIGHT);
+    if (!cap.isOpened()) {
+        std::cerr << "Error: Unable to open /dev/video0.\n";
+        munmap((void*)axi, 0x10000);
+        close(mem_fd);
+        munmap(shared_mem, total_bytes);
+        close(udma_fd);
+        return -1;
+    }
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Run benchmarks
-        result_pl, pl_ms = process_pl(gray)
-        _, ps_ms         = process_ps(gray)
+    cv::Mat frame, gray;
+    for (int i = 0; i < 20; i++) cap >> frame; // Stabilize auto-exposure
+    if (frame.empty()) {
+        std::cerr << "Error: Captured frame is empty.\n";
+        return -1;
+    }
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    if (gray.cols != WIDTH || gray.rows != HEIGHT) {
+        cv::resize(gray, gray, cv::Size(WIDTH, HEIGHT));
+    }
+    cv::imwrite("debug_input.jpg", gray);
 
-        # Draw centroids
-        mask = (result_pl > 0).astype(np.uint8)
-        n, _, _, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        for cx, cy in centroids[1:1 + MAX_DRAW]:
-            cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+    // 6. Memory Copy and Cache Flush
+    memcpy(in_buf, gray.data, frame_bytes);
+    memset(out_buf, 0, frame_bytes);
 
-        frames += 1
-        fps = frames / (time.time() - fps_start)
-        
-        cv2.putText(frame, f"FPS: {fps:.1f} | Corners: {n - 1}", (10, 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
-        cv2.putText(frame, f"PS (CPU): {ps_ms:.1f} ms", (10, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 255), 2)
-        cv2.putText(frame, f"PL (FPGA): {pl_ms:.1f} ms", (10, 75), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 140, 0), 2)
+    int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+    if (sync_dev >= 0) {
+        ssize_t s = write(sync_dev, "1", 1);
+        (void)s;
+        close(sync_dev);
+    }
 
-        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        image_widget.value = jpeg.tobytes()
+    // 7. Hardware Trigger & Busy-Wait (Matches PYNQ behavior)
+    std::cout << "[3] Triggering FPGA...\n";
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-except KeyboardInterrupt:
-    print("Stream stopped." )
-finally:
-    cap.release()
-    in_buf.freebuffer()
-    out_buf.freebuffer()
-    print("Buffers freed.")
+    axi[0x00 / 4] = 0x01; // AP_START
+
+    // Tight busy-wait loop matching Python's while not (ip.read(CTRL) & AP_DONE): pass
+    uint32_t poll_count = 0;
+    while (!(axi[0x00 / 4] & 0x02)) {
+        poll_count++;
+        if (poll_count > 50000000) {
+            std::cerr << "[ERROR] Hardware timeout! IP deadlocked.\n";
+            break;
+        }
+    }
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    std::cout << "[4] FPGA Done received! Execution Time: " << latency_ms << " ms "
+              << "(Poll iterations: " << poll_count << ")\n";
+
+    // Invalidate CPU cache to fetch written data from DDR
+    int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+    if (sync_cpu >= 0) {
+        ssize_t s = write(sync_cpu, "1", 1);
+        (void)s;
+        close(sync_cpu);
+    }
+
+    // 8. Output Analysis & Centroid Overlay (Matches PYNQ cv2.connectedComponentsWithStats)
+    cv::Mat mask_fpga(HEIGHT, WIDTH, CV_8UC1, out_buf);
+    cv::Mat binary_mask = (mask_fpga > 0);
+
+    cv::Mat labels, stats, centroids;
+    int n_labels = cv::connectedComponentsWithStats(binary_mask, labels, stats, centroids, 8);
+    int total_corners = n_labels - 1; // Exclude background label 0
+
+    std::cout << "[5] Results: Detected Corners = " << total_corners << "\n";
+
+    cv::Mat overlay = frame.clone();
+    cv::resize(overlay, overlay, cv::Size(WIDTH, HEIGHT));
+    for (int i = 1; i < n_labels && i <= 1000; i++) {
+        double cx = centroids.at<double>(i, 0);
+        double cy = centroids.at<double>(i, 1);
+        cv::circle(overlay, cv::Point(cvRound(cx), cvRound(cy)), 3, cv::Scalar(0, 255, 0), -1);
+    }
+
+    cv::imwrite("debug_corners.jpg", binary_mask);
+    cv::imwrite("debug_overlay.jpg", overlay);
+    std::cout << "    - Saved 'debug_corners.jpg' and 'debug_overlay.jpg'\n";
+
+    // Clean up
+    munmap((void*)axi, 0x10000);
+    close(mem_fd);
+    munmap(shared_mem, total_bytes);
+    close(udma_fd);
+    return 0;
+}
