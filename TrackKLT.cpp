@@ -529,11 +529,35 @@ memcpy(shared_mem, img_fpga.data, frame_bytes);
 memset(shared_mem + frame_bytes, 0, frame_bytes); // Clear output buffer
 
 // 3. Flush Cache & Trigger FPGA
+// int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+// if(sync_dev >= 0) { if(write(sync_dev, "1", 1)<0){} close(sync_dev); }
+//
+// axi[0x00/4] = 0x1;
+// while (!(axi[0x00/4] & 0x2)) {}
+//
+// int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+// if(sync_cpu >= 0) { if(write(sync_cpu, "1", 1)<0){} close(sync_cpu); }
+
 int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
 if(sync_dev >= 0) { if(write(sync_dev, "1", 1)<0){} close(sync_dev); }
 
+// Re-assert the physical address to the FPGA just in case the AXI bus reset
+axi[0x10/4] = (uint32_t)(phys_in & 0xFFFFFFFF);
+axi[0x14/4] = (uint32_t)(phys_in >> 32);
+
+// Trigger the AXI Start bit
 axi[0x00/4] = 0x1;
-while (!(axi[0x00/4] & 0x2)) {}
+
+// Wait for the FPGA with a timeout to prevent ROS 2 from freezing
+int timeout = 0;
+while (!(axi[0x00/4] & 0x2)) {
+    timeout++;
+    if (timeout > 1000000) {
+        printf("[FPGA ERROR] Timeout! Hardware deadlocked. AXI Control State: 0x%X\n", axi[0x00/4]);
+        break;
+    }
+    usleep(10);
+}
 
 int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
 if(sync_cpu >= 0) { if(write(sync_cpu, "1", 1)<0){} close(sync_cpu); }
