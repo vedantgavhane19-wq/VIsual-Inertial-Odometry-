@@ -6,7 +6,7 @@
 #include <string.h>
 #include <opencv2/opencv.hpp>
 
-// Helper to configure u-dma-buf cache synchronization parameters
+// Configure u-dma-buf cache synchronization parameters in sysfs
 void configure_udmabuf_sync(size_t size) {
     FILE* f_sz = fopen("/sys/class/u-dma-buf/udmabuf0/sync_size", "w");
     if (f_sz) {
@@ -32,7 +32,7 @@ int main() {
         }
         fclose(f);
     } else {
-        std::cerr << "Error: Cannot open udmabuf0 phys_addr. Is the bitstream loaded?\n";
+        std::cerr << "Error: Cannot open udmabuf0 phys_addr. Is bitstream loaded?\n";
         return -1;
     }
 
@@ -51,17 +51,16 @@ int main() {
     const size_t frame_bytes = width * height;
     const size_t total_bytes = frame_bytes * 2;
     const int threshold = 5;
-    const int k_param = 2621;
+    const int k_param = 2621; // k = 0.04 in Q0.16 format
 
     if (actual_buf_size > 0 && actual_buf_size < total_bytes) {
         std::cerr << "Error: udmabuf0 (" << actual_buf_size << " bytes) is too small! Need: " << total_bytes << " bytes.\n";
         return -1;
     }
 
-    // Configure sync parameters for u-dma-buf
     configure_udmabuf_sync(total_bytes);
 
-    // 2. Open udmabuf0 as normal cacheable memory (NO O_SYNC to avoid NEON Bus Error)
+    // 2. Open udmabuf0 as normal cacheable memory
     std::cout << "[1] Opening udmabuf0 (Cacheable)...\n";
     int udma_fd = open("/dev/udmabuf0", O_RDWR);
     if (udma_fd < 0) {
@@ -75,22 +74,23 @@ int main() {
         return -1;
     }
 
-    // 3. Open AXI registers via /dev/mem (O_SYNC is required for MMIO)
-    std::cout << "[3] Writing AXI configuration...\n";
-    
-    // Pointer 1: img_in (64-bit)
-    axi[0x10 / 4] = (uint32_t)(phys_in & 0xFFFFFFFF);
-    axi[0x14 / 4] = (uint32_t)(phys_in >> 32);
-
-    // Pointer 2: img_out (64-bit) -> starts at 0x18, NOT 0x1C
-    axi[0x18 / 4] = (uint32_t)((phys_in + frame_bytes) & 0xFFFFFFFF);
-    axi[0x1C / 4] = (uint32_t)((phys_in + frame_bytes) >> 32);
-
-    // Scalar arguments (each 32-bit scalar occupies 4 or 8 bytes)
-    axi[0x20 / 4] = height;      // rows
-    axi[0x24 / 4] = width;       // cols
-    axi[0x28 / 4] = 5;           // threshold (lowered to detect contrast)
-    axi[0x2C / 4] = 2621;        // k parameter
+    // 3. Open AXI registers via /dev/mem (declared before any usage)
+    std::cout << "[2] Opening AXI Registers via /dev/mem...\n";
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd < 0) {
+        perror("Error opening /dev/mem (must run with sudo)");
+        munmap(shared_mem, total_bytes);
+        close(udma_fd);
+        return -1;
+    }
+    volatile uint32_t* axi = (volatile uint32_t*)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0xB0000000);
+    if (axi == MAP_FAILED) {
+        perror("Error mmap AXI registers");
+        close(mem_fd);
+        munmap(shared_mem, total_bytes);
+        close(udma_fd);
+        return -1;
+    }
 
     // 4. Configure AXI Core Registers
     std::cout << "[3] Writing AXI configuration...\n";
@@ -138,7 +138,7 @@ int main() {
     memcpy(shared_mem, img_fpga.data, frame_bytes);
     memset(shared_mem + frame_bytes, 0, frame_bytes);
 
-    // Flush CPU L1/L2 caches to DDR memory for the FPGA
+    // Flush CPU cache to DDR for FPGA
     int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
     if (sync_dev >= 0) {
         ssize_t s = write(sync_dev, "1", 1);
@@ -146,45 +146,35 @@ int main() {
         close(sync_dev);
     }
 
-   // 7. AXI Handshake & Live Polling
+    // 7. AXI Handshake & Polling
     std::cout << "[6] Triggering FPGA execution...\n";
     printf("    -> Pre-start Control Reg (0x00): 0x%08X\n", axi[0x00 / 4]);
 
-    // Start the IP
+    // Start IP (bit 0 = 1)
     axi[0x00 / 4] = 0x01;
 
     int timeout = 0;
-    const int max_loops = 30000; // ~3 seconds max
-    bool completed = false;
+    const int max_loops = 50000; // ~5 seconds maximum
+    bool done = false;
+    uint32_t final_status = 0;
 
     while (timeout < max_loops) {
-        uint32_t status = axi[0x00 / 4];
-
-        // Check if ap_done (Bit 1) is asserted
-        if (status & 0x02) {
-            completed = true;
+        final_status = axi[0x00 / 4];
+        // Bit 1 = ap_done
+        if (final_status & 0x02) {
+            done = true;
             break;
         }
-
         timeout++;
         if (timeout % 5000 == 0) {
-            printf("    ... still waiting (loop %d / %d), status = 0x%08X\n", timeout, max_loops, status);
+            printf("    ... polling (loop %d), status = 0x%08X\n", timeout, final_status);
         }
         usleep(100);
     }
 
-    if (!completed) {
-        std::cerr << "\n[FPGA ERROR] Timeout! Hardware deadlocked. Register Dump:\n";
-        printf("    0x00 (Control)  : 0x%08X\n", axi[0x00 / 4]);
-        printf("    0x10 (In Low)   : 0x%08X\n", axi[0x10 / 4]);
-        printf("    0x14 (In High)  : 0x%08X\n", axi[0x14 / 4]);
-        printf("    0x1C (Out Low)  : 0x%08X\n", axi[0x1C / 4]);
-        printf("    0x20 (Out High) : 0x%08X\n", axi[0x20 / 4]);
-        printf("    0x28 (Height)   : 0x%08X\n", axi[0x28 / 4]);
-        printf("    0x30 (Width)    : 0x%08X\n", axi[0x30 / 4]);
-        printf("    0x38 (Threshold): 0x%08X\n", axi[0x38 / 4]);
-        printf("    0x40 (K factor) : 0x%08X\n", axi[0x40 / 4]);
-        
+    if (!done) {
+        std::cerr << "\n[FPGA ERROR] Timeout! Hardware deadlocked. Status: 0x"
+                  << std::hex << final_status << std::dec << "\n";
         munmap((void*)axi, 0x10000);
         close(mem_fd);
         munmap(shared_mem, total_bytes);
@@ -193,10 +183,18 @@ int main() {
     }
 
     std::cout << "[7] FPGA completed! Polling cycles: " << timeout
-              << " | Final Status: 0x" << std::hex << axi[0x00 / 4] << std::dec << "\n";
+              << " | Final Status: 0x" << std::hex << final_status << std::dec << "\n";
 
-    // Clear ap_start / ap_done
+    // Clear control register
     axi[0x00 / 4] = 0x00;
+
+    // Invalidate CPU cache so it reads fresh DDR results from FPGA
+    int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+    if (sync_cpu >= 0) {
+        ssize_t s = write(sync_cpu, "1", 1);
+        (void)s;
+        close(sync_cpu);
+    }
 
     // 8. Output Analysis & Visualization
     cv::Mat mask_fpga(height, width, CV_8UC1, shared_mem + frame_bytes);
@@ -230,7 +228,7 @@ int main() {
     cv::imwrite("debug_overlay.jpg", overlay);
     std::cout << "    - Saved 'debug_corners.jpg' and 'debug_overlay.jpg'\n";
 
-    // Clean up
+    // Cleanup
     munmap((void*)axi, 0x10000);
     close(mem_fd);
     munmap(shared_mem, total_bytes);
