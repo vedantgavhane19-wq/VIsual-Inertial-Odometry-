@@ -4,7 +4,6 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <string.h>
-#include <errno.h>
 #include <opencv2/opencv.hpp>
 
 int main() {
@@ -20,7 +19,6 @@ int main() {
         fclose(f);
     } else {
         std::cerr << "Error: Cannot open /sys/class/u-dma-buf/udmabuf0/phys_addr.\n";
-        std::cerr << "Ensure the bitstream and u-dma-buf driver are loaded.\n";
         return -1;
     }
     std::cout << "[0] FPGA Physical DMA Address: 0x" << std::hex << phys_in << std::dec << "\n";
@@ -28,7 +26,7 @@ int main() {
     const int width = 480;
     const int height = 320;
     const size_t frame_bytes = width * height;
-    const int threshold = 5; // Lower threshold to ensure edge/corner sensitivity
+    const int threshold = 5;
     const int k_param = 2621; // k = 0.04 in Q0.16 format
 
     // 2. Map udmabuf0 with O_SYNC to bypass CPU cache
@@ -79,18 +77,25 @@ int main() {
     cv::VideoCapture cap(0);
     if (!cap.isOpened()) {
         std::cerr << "Error: Unable to open /dev/video0.\n";
-        goto cleanup;
+        munmap((void*)axi, 0x10000);
+        close(mem_fd);
+        munmap(shared_mem, frame_bytes * 2);
+        close(udma_fd);
+        return -1;
     }
 
     cv::Mat frame, gray, img_fpga;
-    // Discard initial 30 frames to allow auto-exposure/white balance stabilization
     for (int i = 0; i < 30; i++) {
         cap >> frame;
     }
 
     if (frame.empty()) {
         std::cerr << "Error: Captured frame is empty.\n";
-        goto cleanup;
+        munmap((void*)axi, 0x10000);
+        close(mem_fd);
+        munmap(shared_mem, frame_bytes * 2);
+        close(udma_fd);
+        return -1;
     }
 
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
@@ -102,89 +107,80 @@ int main() {
     memcpy(shared_mem, img_fpga.data, frame_bytes);
     memset(shared_mem + frame_bytes, 0, frame_bytes);
 
-    // Optional cache sync trigger for hardware
-    {
-        int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
-        if (sync_dev >= 0) {
-            write(sync_dev, "1", 1);
-            close(sync_dev);
-        }
+    // Hardware cache flush
+    int sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+    if (sync_dev >= 0) {
+        ssize_t s = write(sync_dev, "1", 1);
+        (void)s;
+        close(sync_dev);
     }
 
     // 7. AXI Handshake & Polling
     std::cout << "[6] Triggering FPGA execution...\n";
-    // Clear any stale ap_done/ap_start bits
     axi[0x00 / 4] = 0x00;
     usleep(50);
+    axi[0x00 / 4] = 0x01; // Start IP
 
-    // Assert ap_start (Bit 0)
-    axi[0x00 / 4] = 0x01;
-
-    {
-        int timeout = 0;
-        // Wait until ap_done (Bit 1) is high
-        while (!(axi[0x00 / 4] & 0x02)) {
-            timeout++;
-            if (timeout > 2000000) {
-                std::cerr << "\n[FPGA ERROR] Timeout! Hardware deadlocked. Status: 0x"
-                          << std::hex << axi[0x00 / 4] << std::dec << "\n";
-                goto cleanup;
-            }
-            usleep(10);
+    int timeout = 0;
+    while (!(axi[0x00 / 4] & 0x02)) {
+        timeout++;
+        if (timeout > 2000000) {
+            std::cerr << "\n[FPGA ERROR] Timeout! Hardware deadlocked. Status: 0x"
+                      << std::hex << axi[0x00 / 4] << std::dec << "\n";
+            munmap((void*)axi, 0x10000);
+            close(mem_fd);
+            munmap(shared_mem, frame_bytes * 2);
+            close(udma_fd);
+            return -1;
         }
-        std::cout << "[7] FPGA completed successfully! Polling cycles: " << timeout
-                  << " | Final Status: 0x" << std::hex << axi[0x00 / 4] << std::dec << "\n";
+        usleep(10);
     }
+    std::cout << "[7] FPGA completed! Polling cycles: " << timeout
+              << " | Final Status: 0x" << std::hex << axi[0x00 / 4] << std::dec << "\n";
 
-    // Clear ap_start / ap_done
     axi[0x00 / 4] = 0x00;
 
-    // Optional cache sync trigger for CPU
-    {
-        int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
-        if (sync_cpu >= 0) {
-            write(sync_cpu, "1", 1);
-            close(sync_cpu);
-        }
+    // CPU cache invalidate
+    int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+    if (sync_cpu >= 0) {
+        ssize_t s = write(sync_cpu, "1", 1);
+        (void)s;
+        close(sync_cpu);
     }
 
     // 8. Output Analysis & Visualization
-    {
-        cv::Mat mask_fpga(height, width, CV_8UC1, shared_mem + frame_bytes);
-        int corners_found = cv::countNonZero(mask_fpga);
+    cv::Mat mask_fpga(height, width, CV_8UC1, shared_mem + frame_bytes);
+    int corners_found = cv::countNonZero(mask_fpga);
 
-        double min_val = 0, max_val = 0;
-        cv::minMaxLoc(mask_fpga, &min_val, &max_val);
+    double min_val = 0, max_val = 0;
+    cv::minMaxLoc(mask_fpga, &min_val, &max_val);
 
-        std::cout << "[8] Detection Results:\n"
-                  << "    - Total corners: " << corners_found << "\n"
-                  << "    - Min pixel value: " << min_val << "\n"
-                  << "    - Max pixel value: " << max_val << "\n";
+    std::cout << "[8] Detection Results:\n"
+              << "    - Total corners: " << corners_found << "\n"
+              << "    - Min pixel value: " << min_val << "\n"
+              << "    - Max pixel value: " << max_val << "\n";
 
-        // Save normalized binary corner mask
-        cv::Mat visible_mask;
-        if (max_val == 1) {
-            visible_mask = mask_fpga * 255;
-        } else {
-            visible_mask = mask_fpga.clone();
-        }
-        cv::imwrite("debug_corners.jpg", visible_mask);
+    cv::Mat visible_mask;
+    if (max_val == 1) {
+        visible_mask = mask_fpga * 255;
+    } else {
+        visible_mask = mask_fpga.clone();
+    }
+    cv::imwrite("debug_corners.jpg", visible_mask);
 
-        // Render detected corners directly over the captured camera frame
-        cv::Mat overlay;
-        cv::resize(frame, overlay, cv::Size(width, height));
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
-                if (mask_fpga.at<uint8_t>(r, c) > 0) {
-                    cv::circle(overlay, cv::Point(c, r), 3, cv::Scalar(0, 0, 255), -1);
-                }
+    cv::Mat overlay;
+    cv::resize(frame, overlay, cv::Size(width, height));
+    for (int r = 0; r < height; r++) {
+        for (int c = 0; c < width; c++) {
+            if (mask_fpga.at<uint8_t>(r, c) > 0) {
+                cv::circle(overlay, cv::Point(c, r), 3, cv::Scalar(0, 0, 255), -1);
             }
         }
-        cv::imwrite("debug_overlay.jpg", overlay);
-        std::cout << "    - Saved 'debug_corners.jpg' and 'debug_overlay.jpg'\n";
     }
+    cv::imwrite("debug_overlay.jpg", overlay);
+    std::cout << "    - Saved 'debug_corners.jpg' and 'debug_overlay.jpg'\n";
 
-cleanup:
+    // Clean up
     munmap((void*)axi, 0x10000);
     close(mem_fd);
     munmap(shared_mem, frame_bytes * 2);
