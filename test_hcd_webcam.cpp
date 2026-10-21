@@ -147,38 +147,57 @@ int main() {
         close(sync_dev);
     }
 
-    // 7. AXI Handshake & Polling
+   // 7. AXI Handshake & Live Polling
     std::cout << "[6] Triggering FPGA execution...\n";
-    axi[0x00 / 4] = 0x00;
-    usleep(50);
-    axi[0x00 / 4] = 0x01; // Start IP
+    printf("    -> Pre-start Control Reg (0x00): 0x%08X\n", axi[0x00 / 4]);
+
+    // Start the IP
+    axi[0x00 / 4] = 0x01;
 
     int timeout = 0;
-    while (!(axi[0x00 / 4] & 0x02)) {
-        timeout++;
-        if (timeout > 2000000) {
-            std::cerr << "\n[FPGA ERROR] Timeout! Hardware deadlocked. Status: 0x"
-                      << std::hex << axi[0x00 / 4] << std::dec << "\n";
-            munmap((void*)axi, 0x10000);
-            close(mem_fd);
-            munmap(shared_mem, total_bytes);
-            close(udma_fd);
-            return -1;
+    const int max_loops = 30000; // ~3 seconds max
+    bool completed = false;
+
+    while (timeout < max_loops) {
+        uint32_t status = axi[0x00 / 4];
+
+        // Check if ap_done (Bit 1) is asserted
+        if (status & 0x02) {
+            completed = true;
+            break;
         }
-        usleep(10);
+
+        timeout++;
+        if (timeout % 5000 == 0) {
+            printf("    ... still waiting (loop %d / %d), status = 0x%08X\n", timeout, max_loops, status);
+        }
+        usleep(100);
     }
+
+    if (!completed) {
+        std::cerr << "\n[FPGA ERROR] Timeout! Hardware deadlocked. Register Dump:\n";
+        printf("    0x00 (Control)  : 0x%08X\n", axi[0x00 / 4]);
+        printf("    0x10 (In Low)   : 0x%08X\n", axi[0x10 / 4]);
+        printf("    0x14 (In High)  : 0x%08X\n", axi[0x14 / 4]);
+        printf("    0x1C (Out Low)  : 0x%08X\n", axi[0x1C / 4]);
+        printf("    0x20 (Out High) : 0x%08X\n", axi[0x20 / 4]);
+        printf("    0x28 (Height)   : 0x%08X\n", axi[0x28 / 4]);
+        printf("    0x30 (Width)    : 0x%08X\n", axi[0x30 / 4]);
+        printf("    0x38 (Threshold): 0x%08X\n", axi[0x38 / 4]);
+        printf("    0x40 (K factor) : 0x%08X\n", axi[0x40 / 4]);
+        
+        munmap((void*)axi, 0x10000);
+        close(mem_fd);
+        munmap(shared_mem, total_bytes);
+        close(udma_fd);
+        return -1;
+    }
+
     std::cout << "[7] FPGA completed! Polling cycles: " << timeout
               << " | Final Status: 0x" << std::hex << axi[0x00 / 4] << std::dec << "\n";
 
+    // Clear ap_start / ap_done
     axi[0x00 / 4] = 0x00;
-
-    // Invalidate CPU cache so it reads fresh DDR memory written by the FPGA
-    int sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
-    if (sync_cpu >= 0) {
-        ssize_t s = write(sync_cpu, "1", 1);
-        (void)s;
-        close(sync_cpu);
-    }
 
     // 8. Output Analysis & Visualization
     cv::Mat mask_fpga(height, width, CV_8UC1, shared_mem + frame_bytes);
