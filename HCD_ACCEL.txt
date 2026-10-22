@@ -158,10 +158,29 @@ Run this exact command in Terminal 1:
 
 ros2 launch ov\_msckf subscribe.launch.py config:=euroc\_mav use\_stereo:=false max\_cameras:=1
 
-
-
 ```
 
 *Verification:* The node will start successfully without the red `SyntaxError` and will print `subscribing to cam: /cam0/image\_raw`, indicating it is waiting for your webcam data.
 
 Did switching back to the default `subscribe.launch.py` file successfully bypass the syntax error and start the node?
+
+
+
+----------------------------------To build ov_core or ov_msckf-------------------------------------------------------
+--First go to ros directory 
+
+cd openvins_ws
+
+--set the number to threads to 2,3 or 4
+
+export MAKEFLAGS=-j3
+
+--use colcon build 
+
+--ov_core
+
+colcon build --packages-select ov_core --cmake-args -DENABLE_ARUCO_TAGS=OFF    
+
+--ov_msckf
+
+colcon build --packages-select ov_msckf --cmake-args -DENABLE_ARUCO_TAGS=OFF
