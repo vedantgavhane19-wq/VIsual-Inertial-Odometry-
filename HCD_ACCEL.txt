@@ -45,6 +45,11 @@ Every time the Kria reboots or a new bitstream is loaded, Linux assigns a new ph
 * **Solution:** Always query the active physical address before running your node.
 ```bash
 
+### To initialize U-DMA buffer
+sudo insmod udmabuf/u-dma-buf.ko udmabuf0=4194304
+###To remove U-DMA buffer
+sudo rmmod udmabuf/u-dma-buf.ko
+
 cat /sys/class/u-dma-buf/udmabuf0/phys\_addr
 
 
