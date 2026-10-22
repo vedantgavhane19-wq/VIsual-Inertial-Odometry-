@@ -1,0 +1,162 @@
+Here are the commands for managing the hardware bitstream on the Kria KV260, followed by the specific solutions to the errors you encountered during the hardware-to-ROS 2 integration.
+
+### 1. Kria KV260 Bitstream Commands (`xmutil`)
+
+Xilinx uses the `xmutil` tool to hot-swap FPGA hardware designs (apps) on the Kria board without needing to reboot Linux.
+
+* **List all installed bitstreams:**
+```bash
+
+sudo xmutil listapps
+
+
+
+```
+
+
+* **Unload the active bitstream:**
+*(Crucial step: You must always unload the current app before loading a new one, otherwise the load command will silently fail).*
+```bash
+
+sudo xmutil unloadapp
+
+
+
+```
+
+
+* **Load your custom bitstream:**
+*(Replace `<your\_app\_name>` with the name of your firmware directory located in `/lib/firmware/xilinx/`).*
+```bash
+
+sudo xmutil loadapp <your\_app\_name>
+
+
+
+```
+
+
+
+### 2. Solutions to Errors Encountered
+
+**Problem: Changing Memory Address Crashes**
+Every time the Kria reboots or a new bitstream is loaded, Linux assigns a new physical address to your direct memory access (`udmabuf0`). If your C++ code uses an old address, the node will crash.
+
+* **Solution:** Always query the active physical address before running your node.
+```bash
+
+cat /sys/class/u-dma-buf/udmabuf0/phys\_addr
+
+
+
+```
+
+
+*Take the hex output from this command and update the `phys\_in` variable in your C++ code.*
+
+**Problem: "Bus Error" when Generating Images**
+OpenCV uses high-speed ARM NEON vector instructions to process images. The ARM architecture strictly prohibits running these instructions on uncached device memory (memory mapped with the `O\_SYNC` flag), resulting in an immediate Bus Error.
+
+* **Solution:** Map the image buffer as cached, while keeping the AXI hardware registers uncached.
+1. Open `/dev/udmabuf0` (Image Data) **without** `O\_SYNC`.
+2. Open `/dev/mem` (AXI Registers) **with** `O\_SYNC`.
+3. Manually flush the cache to DDR RAM before the FPGA reads it, and invalidate it before the CPU reads the result back:
+```cpp
+
+// Flush CPU cache before FPGA trigger
+
+int sync\_dev = open("/sys/class/u-dma-buf/udmabuf0/sync\_for\_device", O\_WRONLY);
+
+if(sync\_dev >= 0) { if(write(sync\_dev, "1", 1) < 0) {} close(sync\_dev); }
+
+
+
+// (Trigger AXI Registers Here)
+
+
+
+// Invalidate CPU cache so OpenCV sees the new FPGA data
+
+int sync\_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync\_for\_cpu", O\_WRONLY);
+
+if(sync\_cpu >= 0) { if(write(sync\_cpu, "1", 1) < 0) {} close(sync\_cpu); }
+
+
+
+```
+
+
+
+
+
+**Problem: `Package 'ov\_msckf' not found\*\*`
+ROS 2 could not find the OpenVINS packages because the terminal was only searching the default `/opt/ros/humble` directories instead of your custom workspace.
+
+* **Solution:** You must source the local install setup file from the root of your workspace in every new terminal window before launching.
+```bash
+
+cd \~/openvins\_ws
+
+source install/setup.bash
+
+
+
+```
+
+
+
+**Problem: Changes to `.yaml` Configs or `.launch.py` Files Not Applied**
+When you modified `estimator\_config.yaml` to disable stereo and created `webcam.launch.py`, ROS 2 still loaded the old settings or threw a "file not found" error. This happens because ROS 2 runs files from the hidden `install` directory, not the `src` directory, and `colcon` did not copy the new files over.
+
+* **Solution:** Force the build system to re-compile and copy the specific package containing the launch/config files to the install space.
+```bash
+
+cd \~/openvins\_ws
+
+colcon build --packages-select ov\_msckf
+
+source install/setup.bash
+
+
+
+```
+
+
+g++ -O3 test_hcd.cpp -o test_hcd $(pkg-config --cflags --libs opencv4)
+sudo ./test_hcd
+
+
+Check if the Device Node Exists
+Run this command to see if /dev/udmabuf0 is currently present:
+
+Bash
+ls -l /dev/udmabuf0
+
+Reload u-dma-buf and Reserve the 4 MB Buffer
+Re-insert the kernel module from your udmabuf folder and set read/write permissions:
+
+Bash
+sudo insmod ~/udmabuf/u-dma-buf.ko udmabuf0=4194304
+sudo chmod 666 /dev/udmabuf0
+
+Verification: Run cat /sys/class/u-dma-buf/udmabuf0/phys_addr. It should print your physical DDR base address (e.g., 0x0000000039000000).
+
+
+
+The error happens because your `webcam.launch.py` file contains XML code, but because it has a `.py` extension, ROS 2 tries to read it as a standard Python script. When the ROS 2 launcher sees the `<launch>` tag on line 1, it immediately crashes with a `SyntaxError`. It appears the contents of an older ROS 1 XML launch file were accidentally placed into this file.
+
+The simplest and fastest way to fix this is to abandon the broken `webcam.launch.py` file entirely. Your terminal command already contains the correct overrides (`use\_stereo:=false max\_cameras:=1`), so we just need to point that command back to the original, working launch file.
+
+Run this exact command in Terminal 1:
+
+```bash
+
+ros2 launch ov\_msckf subscribe.launch.py config:=euroc\_mav use\_stereo:=false max\_cameras:=1
+
+
+
+```
+
+*Verification:* The node will start successfully without the red `SyntaxError` and will print `subscribing to cam: /cam0/image\_raw`, indicating it is waiting for your webcam data.
+
+Did switching back to the default `subscribe.launch.py` file successfully bypass the syntax error and start the node?
