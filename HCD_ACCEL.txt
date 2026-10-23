@@ -179,7 +179,20 @@ export MAKEFLAGS=-j3
 
 --ov_core
 
-colcon build --packages-select ov_core --cmake-args -DENABLE_ARUCO_TAGS=OFF    
+colcon build --packages-select ov_core --cmake-args -DENABLE_ARUCO_TAGS=OFF 
+
+
+
+Launch OpenVINS in Monocular Mode
+
+sudo -E bash -c "export PYTHONUNBUFFERED=1 && \
+source /opt/ros/humble/setup.bash && \
+source /home/ubuntu/openvins_ws/install/setup.bash && \
+ros2 launch ov_msckf subscribe.launch.py \
+config:=euroc_mav \
+use_stereo:=false \
+max_cameras:=1 \
+verbosity:=ALL"   
 
 --ov_msckf
 
