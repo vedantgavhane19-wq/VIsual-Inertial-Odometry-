@@ -183,7 +183,7 @@ colcon build --packages-select ov_core --cmake-args -DENABLE_ARUCO_TAGS=OFF
 
 
 
-Launch OpenVINS in Monocular Mode
+Step 1 Launch OpenVINS in Monocular Mode (terminal 1)
 
 sudo -E bash -c "export PYTHONUNBUFFERED=1 && \
 source /opt/ros/humble/setup.bash && \
@@ -197,3 +197,19 @@ verbosity:=ALL"
 --ov_msckf
 
 colcon build --packages-select ov_msckf --cmake-args -DENABLE_ARUCO_TAGS=OFF
+
+
+step 2 Run the Bag Playback with sudo (terminal 2)
+
+sudo -E bash -c "source /opt/ros/humble/setup.bash && ros2 bag play /home/ubuntu/openvins_ws/MH_01_easy_ros2 -l --topics /imu0 /cam0/image_raw"
+
+source /opt/ros/humble/setup.bash
+ros2 topic hz /ov_msckf/track_image
+ros2 topic hz /ov_msckf/poseimu
+
+
+
+Step 3: Configure RViz2 for OpenVINS
+
+xhost +local:root
+sudo -E bash -c "source /opt/ros/humble/setup.bash && rviz2"
