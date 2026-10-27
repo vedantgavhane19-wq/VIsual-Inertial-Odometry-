@@ -225,85 +225,151 @@ localparam integer ADDR_LSB = 2; // (32-bit = 4 bytes per word, so LSB is 2)
 
 --------------------------------------------load bitstream in vivado --------------------------------------------------------
 
-ubuntu@kria:~$ sudo busybox devmem 0xB0000010 32 0x11111111
+To load an accelerator using `xmutil loadapp`, the `dfx-mgr` daemon on the Kria KV260 requires a dedicated firmware folder containing three specific files with matching names:
 
-ubuntu@kria:~$ sudo busybox devmem 0xB0000014 32 0x22222222
+1. **`<app_name>.bit.bin`** — Your converted bitstream
+2. **`<app_name>.dtbo`** — The compiled Device Tree Overlay (enables PL clocks and AXI interfaces)
+3. **`shell.json`** — The descriptor file for the firmware manager
 
-ubuntu@kria:~$ sudo busybox devmem 0xB0000018 32 0x33333333
+---
 
-ubuntu@kria:~$ sudo busybox devmem 0xB000001C 32 0x44444444
+### Step 1: Create the Accelerator Directory
 
-ubuntu@kria:~$ for a in 0x00 0x04 0x08 0x0C 0x10 0x14 0x18 0x1C; do
+Create a directory under `/lib/firmware/xilinx/`. The folder name will be your app name for `xmutil` (e.g., `design_2`):
 
-printf "%s -> " $a; sudo busybox devmem $((0xB0000000 + a)) 32
+```bash
+sudo mkdir -p /lib/firmware/xilinx/design_2
 
-done
+```
 
-0x00 -> 0x00000004
+---
 
-0x04 -> 0x00000004
+### Step 2: Copy and Rename the Bitstream
 
-0x08 -> 0x00000004
+Move and rename your `.bin` file so its prefix matches the directory name:
 
-0x0C -> 0x00000004
+```bash
+sudo cp ~/bootgen/design_2_wrapper.bit.bin /lib/firmware/xilinx/design_2/design_2.bit.bin
 
-0x10 -> 0x11111111
+```
 
-0x14 -> 0x11111111
+---
 
-0x18 -> 0x11111111
+### Step 3: Create `shell.json`
 
-0x1C -> 0x11111111
+Create the descriptor file inside the folder:
 
-
-
-ubuntu@kria:~$ nano probe128.c
-
-ubuntu@kria:~$ gcc -O1 probe128.c -o probe128
-
-ubuntu@kria:~$ sudo xmutil unloadapp && sudo xmutil loadapp design_1_wrapper
-
-remove from slot 0 returns: 0 (Ok)
-
-design_1_wrapper: loaded to slot 0
-
-ubuntu@kria:~$ sudo ./probe128
-
-128-bit read 0x00: 00000004 00000004 00000004 00000004
-
-128-bit read 0x10: 11111111 11111111 11111111 11111111
-
-ubuntu@kria:~$
-
-
-#include <arm_neon.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <sys/mman.h>
-
-int main(void) {
-    int fd = open("/dev/mem", O_RDWR | O_SYNC);
-    uint8_t *b = mmap(0, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0xB0000000);
-    uint32_t r[4];
-
-    vst1q_u32(r, vld1q_u32((uint32_t *)(b + 0x00)));
-    printf("128-bit read 0x00: %08x %08x %08x %08x\n", r[0], r[1], r[2], r[3]);
-
-    uint32_t w[4] = {0x11111111, 0x22222222, 0x00000000, 0x44444444};
-    vst1q_u32((uint32_t *)(b + 0x10), vld1q_u32(w));
-    __sync_synchronize();
-
-    vst1q_u32(r, vld1q_u32((uint32_t *)(b + 0x10)));
-    printf("128-bit read 0x10: %08x %08x %08x %08x\n", r[0], r[1], r[2], r[3]);
-    return 0;
+```bash
+sudo bash -c 'cat << EOF > /lib/firmware/xilinx/design_2/shell.json
+{
+  "shell_type": "legacy",
+  "num_slots": "1"
 }
+EOF'
 
-gcc -O1 probe128.c -o probe128
-sudo xmutil unloadapp && sudo xmutil loadapp design_1_wrapper
-sudo ./probe128
+```
+
+---
+
+### Step 4: Add the Device Tree Overlay (`design_2.dtbo`)
+
+`dfx-mgr` will fail to load the app if a matching `.dtbo` is missing.
+
+* **If you already generated `design_2.dtbo`:**
+```bash
+sudo cp path/to/design_2.dtbo /lib/firmware/xilinx/design_2/design_2.dtbo
+
+```
 
 
-cehck the this was the testing code and th output are displayed above 
+* **If you do not have a `.dtbo` yet:**
+Create a minimal overlay to enable the PL clocks and allow `xmutil` to program the PL:
+1. Create a Device Tree Source (`design_2.dtsi`):
+```bash
+cat << 'EOF' > design_2.dtsi
+/dts-v1/;
+/plugin/;
 
+&amba {
+    overlay {
+        target-path = "/amba";
+        #address-cells = <2>;
+        #size-cells = <2>;
+        __overlay__ {
+            #address-cells = <2>;
+            #size-cells = <2>;
+        };
+    };
+};
+EOF
+
+```
+
+
+2. Compile it using `dtc` and place it in the firmware directory:
+```bash
+sudo apt-get install -y device-tree-compiler
+dtc -@ -I dts -O dtb -o design_2.dtbo design_2.dtsi
+sudo cp design_2.dtbo /lib/firmware/xilinx/design_2/
+
+```
+
+
+
+
+
+---
+
+### Step 5: Verify the Folder Contents
+
+Ensure the directory has all three required files:
+
+```bash
+ls -l /lib/firmware/xilinx/design_2/
+
+```
+
+You should see:
+
+```text
+design_2.bit.bin
+design_2.dtbo
+shell.json
+
+```
+
+---
+
+### Step 6: Load the Accelerator with `xmutil`
+
+1. **Check if the app is visible:**
+```bash
+sudo xmutil listapps
+
+```
+
+
+`design_2` should appear in the table with an `Inactive` status.
+2. **Unload the current active app (if any):**
+```bash
+sudo xmutil unloadapp
+
+```
+
+
+3. **Load your accelerator:**
+```bash
+sudo xmutil loadapp design_2
+
+```
+
+
+4. **Confirm PL programming:**
+```bash
+sudo xmutil listapps
+
+```
+
+
+`design_2` should now be listed with the `Active` status, and the green PL configuration LED on the KV260 board will light up.
 --------------------------------------------------------------------------------------------------------------------
