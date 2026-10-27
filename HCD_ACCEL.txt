@@ -214,22 +214,6 @@ Step 3: Configure RViz2 for OpenVINS
 xhost +local:root
 sudo -E bash -c "source /opt/ros/humble/setup.bash && rviz2"
 
-------------Temp --------------------------------------------------------------------------------------------------------------------------------------------------
-
-Option A: 
-// Capture all 128 bits (16 bytes)
-always @(posedge S_AXI_ACLK) begin
-    if (!S_AXI_ARESETN) begin
-        reg_data <= 128'd0;
-    end else if (slv_reg_wren) begin
-        if (S_AXI_WSTRB[0])  reg_data[7:0]     <= S_AXI_WDATA[7:0];
-        if (S_AXI_WSTRB[1])  reg_data[15:8]    <= S_AXI_WDATA[15:8];
-        // ... continue for all bytes up to WSTRB[15] and WDATA[127:120]
-    end
-end
-
-assign S_AXI_RDATA = reg_data; // Return the full 128-bit word
-
 
 
 Option B:
