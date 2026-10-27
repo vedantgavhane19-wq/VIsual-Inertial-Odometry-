@@ -220,3 +220,90 @@ Option B:
 localparam integer ADDR_LSB = 2; // (32-bit = 4 bytes per word, so LSB is 2)
 // Register index decoded from axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS : ADDR_LSB]
 
+
+
+
+--------------------------------------------load bitstream in vivado --------------------------------------------------------
+
+ubuntu@kria:~$ sudo busybox devmem 0xB0000010 32 0x11111111
+
+ubuntu@kria:~$ sudo busybox devmem 0xB0000014 32 0x22222222
+
+ubuntu@kria:~$ sudo busybox devmem 0xB0000018 32 0x33333333
+
+ubuntu@kria:~$ sudo busybox devmem 0xB000001C 32 0x44444444
+
+ubuntu@kria:~$ for a in 0x00 0x04 0x08 0x0C 0x10 0x14 0x18 0x1C; do
+
+printf "%s -> " $a; sudo busybox devmem $((0xB0000000 + a)) 32
+
+done
+
+0x00 -> 0x00000004
+
+0x04 -> 0x00000004
+
+0x08 -> 0x00000004
+
+0x0C -> 0x00000004
+
+0x10 -> 0x11111111
+
+0x14 -> 0x11111111
+
+0x18 -> 0x11111111
+
+0x1C -> 0x11111111
+
+
+
+ubuntu@kria:~$ nano probe128.c
+
+ubuntu@kria:~$ gcc -O1 probe128.c -o probe128
+
+ubuntu@kria:~$ sudo xmutil unloadapp && sudo xmutil loadapp design_1_wrapper
+
+remove from slot 0 returns: 0 (Ok)
+
+design_1_wrapper: loaded to slot 0
+
+ubuntu@kria:~$ sudo ./probe128
+
+128-bit read 0x00: 00000004 00000004 00000004 00000004
+
+128-bit read 0x10: 11111111 11111111 11111111 11111111
+
+ubuntu@kria:~$
+
+
+#include <arm_neon.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/mman.h>
+
+int main(void) {
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    uint8_t *b = mmap(0, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0xB0000000);
+    uint32_t r[4];
+
+    vst1q_u32(r, vld1q_u32((uint32_t *)(b + 0x00)));
+    printf("128-bit read 0x00: %08x %08x %08x %08x\n", r[0], r[1], r[2], r[3]);
+
+    uint32_t w[4] = {0x11111111, 0x22222222, 0x00000000, 0x44444444};
+    vst1q_u32((uint32_t *)(b + 0x10), vld1q_u32(w));
+    __sync_synchronize();
+
+    vst1q_u32(r, vld1q_u32((uint32_t *)(b + 0x10)));
+    printf("128-bit read 0x10: %08x %08x %08x %08x\n", r[0], r[1], r[2], r[3]);
+    return 0;
+}
+
+gcc -O1 probe128.c -o probe128
+sudo xmutil unloadapp && sudo xmutil loadapp design_1_wrapper
+sudo ./probe128
+
+
+cehck the this was the testing code and th output are displayed above 
+
+--------------------------------------------------------------------------------------------------------------------
