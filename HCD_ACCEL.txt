@@ -378,13 +378,15 @@ sudo xmutil listapps
 
 // --- FEATURE EXTRACTION (FPGA ACCELERATED WITH CPU FALLBACK) ---
   std::vector<cv::KeyPoint> pts0_ext;
-  bool hw_ok = HcdAccelerator::getInstance().detect(img0pyr.at(0), pts0_ext);
-
-  if (!hw_ok || pts0_ext.size() < 20) {
-    if (HcdAccelerator::getInstance().isInitialized()) {
-      PRINT_WARNING(YELLOW "[FPGA] insufficient points (%zu), falling back to CPU FAST\n" RESET, pts0_ext.size());
+  if (HcdAccelerator::getInstance().isInitialized()) {
+    detect_fpga(img0pyr.at(0), pts0_ext);
+    if (pts0_ext.size() < 20) {
+      PRINT_WARNING(YELLOW "[FPGA] Insufficient points (%zu), using CPU FAST for this frame.\n" RESET, pts0_ext.size());
+      pts0_ext.clear();
+      Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext,
+                                   num_features, grid_x, grid_y, threshold, true);
     }
-    pts0_ext.clear();
+  } else {
     Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext,
                                  num_features, grid_x, grid_y, threshold, true);
   }
