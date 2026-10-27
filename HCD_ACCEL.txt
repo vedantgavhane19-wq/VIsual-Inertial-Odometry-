@@ -377,3 +377,217 @@ sudo xmutil listapps
 
 
 
+--------------------------------------------HCDaccelerator.hpp-----------------------------------------------------------------------------------------------------
+
+#pragma once
+
+#include <chrono>
+#include <fcntl.h>
+#include <mutex>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <vector>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+
+namespace ov_core {
+
+class HcdAccelerator {
+public:
+  static constexpr uint32_t FPGA_WIDTH = 480;
+  static constexpr uint32_t FPGA_HEIGHT = 320;
+  static constexpr size_t FPGA_FRAME_BYTES = FPGA_WIDTH * FPGA_HEIGHT;
+  static constexpr size_t FPGA_TOTAL_BYTES = FPGA_FRAME_BYTES * 2;
+  static constexpr uint32_t FPGA_THRESHOLD = 1500;
+  static constexpr uint32_t FPGA_K_SCALED = 2621;
+  static constexpr off_t FPGA_AXI_BASE = 0xB0000000;
+
+  static HcdAccelerator &getInstance() {
+    static HcdAccelerator instance;
+    return instance;
+  }
+
+  bool isInitialized() const { return initialized_; }
+
+  bool detect(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ext) {
+    if (!initialized_ || img.empty()) {
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lock(hw_mutex_);
+
+    // 1. Convert to grayscale and resize to IP dimensions (480x320)
+    cv::Mat gray_in;
+    if (img.channels() == 3) {
+      cv::cvtColor(img, gray_in, cv::COLOR_BGR2GRAY);
+    } else {
+      gray_in = img;
+    }
+
+    cv::Mat img_fpga;
+    if (gray_in.cols != static_cast<int>(FPGA_WIDTH) ||
+        gray_in.rows != static_cast<int>(FPGA_HEIGHT)) {
+      cv::resize(gray_in, img_fpga, cv::Size(FPGA_WIDTH, FPGA_HEIGHT));
+    } else {
+      img_fpga = gray_in;
+    }
+
+    // 2. Transfer image data to input DMA buffer and clear output buffer
+    uint8_t *in_buf = shared_mem_;
+    uint8_t *out_buf = shared_mem_ + FPGA_FRAME_BYTES;
+    memcpy(in_buf, img_fpga.data, FPGA_FRAME_BYTES);
+    memset(out_buf, 0, FPGA_FRAME_BYTES);
+
+    // 3. Flush CPU cache to DDR for FPGA read access
+    if (sync_dev_fd_ >= 0) {
+      lseek(sync_dev_fd_, 0, SEEK_SET);
+      ssize_t s = write(sync_dev_fd_, "1", 1);
+      (void)s;
+    }
+
+    // 4. Update IP registers for current frame
+    uint64_t phys_out = phys_addr_ + FPGA_FRAME_BYTES;
+    axi_regs_[0x10 / 4] = static_cast<uint32_t>(phys_addr_ & 0xFFFFFFFF);
+    axi_regs_[0x14 / 4] = static_cast<uint32_t>((phys_addr_ >> 32) & 0xFFFFFFFF);
+    axi_regs_[0x1C / 4] = static_cast<uint32_t>(phys_out & 0xFFFFFFFF);
+    axi_regs_[0x20 / 4] = static_cast<uint32_t>((phys_out >> 32) & 0xFFFFFFFF);
+    axi_regs_[0x28 / 4] = FPGA_HEIGHT;
+    axi_regs_[0x30 / 4] = FPGA_WIDTH;
+    axi_regs_[0x38 / 4] = FPGA_THRESHOLD;
+    axi_regs_[0x40 / 4] = FPGA_K_SCALED;
+
+    // 5. Trigger execution (AP_START) and poll for completion (AP_DONE)
+    axi_regs_[0x00 / 4] = 0x01; // AP_START
+    auto t0 = std::chrono::steady_clock::now();
+    while (!(axi_regs_[0x00 / 4] & 0x02)) { // Bit 1 = ap_done
+      if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(50)) {
+        axi_regs_[0x00 / 4] = 0x00; // Reset control reg on deadlock
+        return false;
+      }
+    }
+    axi_regs_[0x00 / 4] = 0x00; // Clear start/done
+
+    // 6. Invalidate CPU cache to read FPGA results from DDR
+    if (sync_cpu_fd_ >= 0) {
+      lseek(sync_cpu_fd_, 0, SEEK_SET);
+      ssize_t s = write(sync_cpu_fd_, "1", 1);
+      (void)s;
+    }
+
+    // 7. Extract corner centroids from binary response map
+    cv::Mat mask_fpga(FPGA_HEIGHT, FPGA_WIDTH, CV_8UC1, out_buf);
+    cv::Mat binary_mask = (mask_fpga > 0);
+    cv::Mat labels, stats, centroids;
+    int n_labels = cv::connectedComponentsWithStats(binary_mask, labels, stats, centroids, 8);
+
+    float scale_u = static_cast<float>(img.cols) / static_cast<float>(FPGA_WIDTH);
+    float scale_v = static_cast<float>(img.rows) / static_cast<float>(FPGA_HEIGHT);
+
+    pts_ext.clear();
+    for (int i = 1; i < n_labels && i <= 1000; i++) {
+      float cx = static_cast<float>(centroids.at<double>(i, 0)) * scale_u;
+      float cy = static_cast<float>(centroids.at<double>(i, 1)) * scale_v;
+      pts_ext.emplace_back(cx, cy, 1.0f);
+    }
+
+    return (pts_ext.size() >= 20);
+  }
+
+private:
+  HcdAccelerator() {
+    // 1. Read physical base address from udmabuf0 sysfs
+    FILE *f_addr = fopen("/sys/class/u-dma-buf/udmabuf0/phys_addr", "r");
+    if (!f_addr || fscanf(f_addr, "%lx", &phys_addr_) != 1) {
+      if (f_addr) fclose(f_addr);
+      return;
+    }
+    fclose(f_addr);
+
+    // 2. Configure udmabuf cache sync attributes
+    FILE *f_sz = fopen("/sys/class/u-dma-buf/udmabuf0/sync_size", "w");
+    if (f_sz) {
+      fprintf(f_sz, "%zu\n", FPGA_TOTAL_BYTES);
+      fclose(f_sz);
+    }
+    FILE *f_dir = fopen("/sys/class/u-dma-buf/udmabuf0/sync_direction", "w");
+    if (f_dir) {
+      fprintf(f_dir, "3\n"); // 3 = DMA_BIDIRECTIONAL
+      fclose(f_dir);
+    }
+    FILE *f_off = fopen("/sys/class/u-dma-buf/udmabuf0/sync_offset", "w");
+    if (f_off) {
+      fprintf(f_off, "0\n");
+      fclose(f_off);
+    }
+
+    // 3. Open udmabuf0 device
+    udma_fd_ = open("/dev/udmabuf0", O_RDWR);
+    if (udma_fd_ < 0) return;
+
+    shared_mem_ = static_cast<uint8_t *>(
+        mmap(NULL, FPGA_TOTAL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, udma_fd_, 0));
+    if (shared_mem_ == MAP_FAILED) {
+      shared_mem_ = nullptr;
+      close(udma_fd_);
+      udma_fd_ = -1;
+      return;
+    }
+
+    // 4. Open /dev/mem for AXI control registers
+    mem_fd_ = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd_ < 0) {
+      munmap(shared_mem_, FPGA_TOTAL_BYTES);
+      shared_mem_ = nullptr;
+      close(udma_fd_);
+      udma_fd_ = -1;
+      return;
+    }
+
+    axi_regs_ = static_cast<volatile uint32_t *>(
+        mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd_, FPGA_AXI_BASE));
+    if (axi_regs_ == MAP_FAILED) {
+      axi_regs_ = nullptr;
+      close(mem_fd_);
+      mem_fd_ = -1;
+      munmap(shared_mem_, FPGA_TOTAL_BYTES);
+      shared_mem_ = nullptr;
+      close(udma_fd_);
+      udma_fd_ = -1;
+      return;
+    }
+
+    // 5. Open sync sysfs file descriptors
+    sync_dev_fd_ = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+    sync_cpu_fd_ = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+
+    initialized_ = true;
+  }
+
+  ~HcdAccelerator() {
+    if (sync_dev_fd_ >= 0) close(sync_dev_fd_);
+    if (sync_cpu_fd_ >= 0) close(sync_cpu_fd_);
+    if (axi_regs_ && axi_regs_ != MAP_FAILED) munmap((void *)axi_regs_, 0x10000);
+    if (mem_fd_ >= 0) close(mem_fd_);
+    if (shared_mem_ && shared_mem_ != MAP_FAILED) munmap(shared_mem_, FPGA_TOTAL_BYTES);
+    if (udma_fd_ >= 0) close(udma_fd_);
+  }
+
+  HcdAccelerator(const HcdAccelerator &) = delete;
+  HcdAccelerator &operator=(const HcdAccelerator &) = delete;
+
+  std::mutex hw_mutex_;
+  bool initialized_{false};
+  uint64_t phys_addr_{0};
+  int udma_fd_{-1};
+  int mem_fd_{-1};
+  int sync_dev_fd_{-1};
+  int sync_cpu_fd_{-1};
+  uint8_t *shared_mem_{nullptr};
+  volatile uint32_t *axi_regs_{nullptr};
+};
+
+} // namespace ov_core
