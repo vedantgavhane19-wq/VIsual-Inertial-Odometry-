@@ -227,13 +227,12 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
     float cy = static_cast<float>(centroids.at<double>(i, 1)) * scale_v;
     pts_ext.emplace_back(cx, cy, 1.0f);
   }
-}
+
 
 // 8. Immediate console confirmation bypassing ROS 2 launch buffering
-  printf(GREEN "[OpenVINS-FPGA] Frame processed on FPGA! Extracted %zu corners in %.2f ms\n" RESET,
-         pts_ext.size(), hw_latency_ms);
+  printf(GREEN "[OpenVINS-FPGA] Frame processed on FPGA! Extracted %zu corners \n" RESET, pts_ext.size());
   fflush(stdout);
-}
+
 
 void TrackKLT::feed_new_camera(const CameraData &message) {
   if (message.sensor_ids.empty() || message.sensor_ids.size() != message.images.size() || message.images.size() != message.masks.size()) {
