@@ -193,18 +193,45 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
   g_axi[0x38 / 4] = FPGA_THRESH;
   g_axi[0x40 / 4] = FPGA_K;
 
-// 5. Trigger hardware execution
+  // 5. Trigger hardware execution and measure wall-clock latency
   auto t_hw_start = std::chrono::high_resolution_clock::now();
-  g_axi[0x00 / 4] = 0x01; // AP_START
 
-  // Fast busy-wait polling (~1 ms execution, cap timeout at ~15 ms)
-  uint32_t timeout = 0;
-  while (!(g_axi[0x00 / 4] & 0x02)) {
-    if (++timeout > 100000) { // 100,000 iterations is ~15ms (never blocks for 15 seconds!)
-      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout (~15ms)! AXI status: 0x%X\n" RESET, g_axi[0x00 / 4]);
+  // Wait until IP is idle before triggering
+  uint32_t idle_wait = 0;
+  while (!(g_axi[0x00 / 4] & 0x04) && ++idle_wait < 10000) {
+    usleep(10);
+  }
+
+  g_axi[0x00 / 4] = 0x01; // Assert AP_START
+
+  // True wall-clock timeout: wait up to 20 ms with bus-yielding usleep
+  bool hw_success = false;
+  while (true) {
+    uint32_t status = g_axi[0x00 / 4];
+    if (status & 0x02) { // ap_done is high
+      hw_success = true;
       break;
     }
+
+    auto t_now = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_now - t_hw_start).count();
+    if (elapsed_ms > 20.0) {
+      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout (>20ms)! AXI status: 0x%X\n" RESET, status);
+      break;
+    }
+
+    // Yield CPU briefly so memory controller has full bandwidth for DMA bursts
+    usleep(25);
   }
+  g_axi[0x00 / 4] = 0x00;
+
+  // If hardware stalled or timed out, abort immediately to allow clean CPU fallback
+  if (!hw_success) {
+    return;
+  }
+
+  auto t_hw_end = std::chrono::high_resolution_clock::now();
+  double hw_latency_ms = std::chrono::duration<double, std::milli>(t_hw_end - t_hw_start).count();
 
   // 6. Invalidate CPU cache to read FPGA results from DDR
   if (g_sync_cpu >= 0) {
@@ -228,11 +255,11 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
     pts_ext.emplace_back(cx, cy, 1.0f);
   }
 
-
-// 8. Immediate console confirmation bypassing ROS 2 launch buffering
-  printf(GREEN "[OpenVINS-FPGA] Frame processed on FPGA! Extracted %zu corners \n" RESET, pts_ext.size());
+  // 8. Immediate console confirmation
+  printf(GREEN "[OpenVINS-FPGA] Frame processed on FPGA! Extracted %zu corners in %.2f ms\n" RESET,
+         pts_ext.size(), hw_latency_ms);
   fflush(stdout);
-
+}
 
 void TrackKLT::feed_new_camera(const CameraData &message) {
   if (message.sensor_ids.empty() || message.sensor_ids.size() != message.images.size() || message.images.size() != message.masks.size()) {
