@@ -196,3 +196,207 @@ int main() {
     close(udma_fd);
     return 0;
 }
+
+
+
+
+
+
+
+import time
+import cv2
+import numpy as np
+import ipywidgets as widgets
+import csv  # Added for CSV logging
+from IPython.display import display
+from pynq import Overlay, allocate
+
+# 1. Overlay & Register Map Setup
+ol = Overlay("design_1_wrapper.bit")
+ip = ol.corner_harris_accel_0
+
+CTRL, SRC_LO, SRC_HI, DST_LO, DST_HI = 0x00, 0x10, 0x14, 0x1C, 0x20
+ROWS, COLS, THRESH, K_SCALE          = 0x28, 0x30, 0x38, 0x40
+AP_START, AP_DONE                    = 0x1, 0x2
+
+WIDTH, HEIGHT = 480, 320
+THRESHOLD     = 150
+K_SCALED      = 2621
+MAX_DRAW      = 300
+CLOCK_FREQ_HZ = 200_000_000  # Global definition for the FPGA clock frequency
+
+in_buf  = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+out_buf = allocate(shape=(HEIGHT, WIDTH), dtype=np.uint8)
+
+def write64(lo, hi, value):
+    ip.write(lo, value & 0xFFFFFFFF)
+    ip.write(hi, (value >> 32) & 0xFFFFFFFF)
+
+write64(SRC_LO, SRC_HI, in_buf.physical_address)
+write64(DST_LO, DST_HI, out_buf.physical_address)
+ip.write(ROWS, HEIGHT)
+ip.write(COLS, WIDTH)
+ip.write(THRESH, THRESHOLD)
+ip.write(K_SCALE, K_SCALED)
+
+# Global data structure to hold performance records for CSV export
+performance_log = []
+
+# 2. Benchmarking Routines
+def process_pl(gray, frame_number):
+    np.copyto(in_buf, gray)
+    
+    # 1. Total System Round-Trip Start
+    t_system_start = time.perf_counter()
+    
+    in_buf.flush()
+    out_buf[:] = 0
+    out_buf.flush()
+    
+    # --- PURE IP EXECUTION START ---
+    t_ip_start = time.perf_counter()
+    
+    ip.write(CTRL, AP_START)
+    while not (ip.read(CTRL) & AP_DONE):
+        pass  # Waiting for hardware
+        
+    t_ip_end = time.perf_counter()
+    # --- PURE IP EXECUTION END ---
+    
+    out_buf.invalidate()
+    
+    t_system_end = time.perf_counter()
+    
+    # 2. Calculate Latencies and Cycles
+    total_pl_ms = (t_system_end - t_system_start) * 1000.0
+    pure_ip_ms = (t_ip_end - t_ip_start) * 1000.0
+    pure_ip_seconds = (t_ip_end - t_ip_start)
+    estimated_cycles = int(pure_ip_seconds * CLOCK_FREQ_HZ)
+    
+    # Print it to the console once every 30 frames to avoid spamming
+    if hasattr(process_pl, "counter"):
+        process_pl.counter += 1
+        if process_pl.counter % 30 == 0:
+            print(f"Frame {frame_number} | Pure IP: {pure_ip_ms:.2f} ms | PL Roundtrip: {total_pl_ms:.2f} ms | Cycles: {estimated_cycles:,}")
+    else:
+        process_pl.counter = 1
+    
+    return np.array(out_buf), total_pl_ms, pure_ip_ms, estimated_cycles
+
+def process_ps(gray):
+    t_start = time.perf_counter()
+    dst = cv2.cornerHarris(gray, blockSize=3, ksize=3, k=0.04)
+    t_end = time.perf_counter()
+    return dst, (t_end - t_start) * 1000.0
+
+# 3. Execution & Visualization
+image_widget = widgets.Image(format='jpeg', width=WIDTH, height=HEIGHT)
+display(image_widget)
+
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+try:
+    fps_start = time.time()
+    frames = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        frames += 1
+        
+        # Run benchmarks
+        result_pl, pl_roundtrip_ms, pure_ip_ms, cycles = process_pl(gray, frames)
+        _, ps_ms = process_ps(gray)
+
+        # Draw centroids
+        mask = (result_pl > 0).astype(np.uint8)
+        n, _, _, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        corners_detected = n - 1
+        
+        for cx, cy in centroids[1:1 + MAX_DRAW]:
+            cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+
+        fps = frames / (time.time() - fps_start)
+        
+        # Save current frame parameters to our global log list
+        performance_log.append({
+            "frame_id": frames,
+            "width": WIDTH,
+            "height": HEIGHT,
+            "pl_freq_hz": CLOCK_FREQ_HZ,
+            "threshold": THRESHOLD,
+            "k_scaled": K_SCALED,
+            "corners_detected": corners_detected,
+            "pure_ip_ms": pure_ip_ms,
+            "pl_roundtrip_ms": pl_roundtrip_ms,
+            "ps_cpu_ms": ps_ms,
+            "hardware_cycles": cycles,
+            "fps": fps
+        })
+        
+        # UI overlays
+        cv2.putText(frame, f"FPS: {fps:.1f} | Corners: {corners_detected}", (10, 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+        cv2.putText(frame, f"PS (CPU): {ps_ms:.1f} ms", (10, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 255), 2)
+        cv2.putText(frame, f"PL (FPGA): {pl_roundtrip_ms:.1f} ms", (10, 75), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 140, 0), 2)
+
+        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        image_widget.value = jpeg.tobytes()
+
+except KeyboardInterrupt:
+    print("\nStream stopped by user.")
+    
+finally:
+    cap.release()
+    in_buf.freebuffer()
+    out_buf.freebuffer()
+    print("Buffers freed.")
+    
+    # 4. Compute Means & Export to CSV
+    if performance_log:
+        # Extract individual arrays to calculate averages
+        pure_ip_times = [row["pure_ip_ms"] for row in performance_log]
+        pl_roundtrips = [row["pl_roundtrip_ms"] for row in performance_log]
+        ps_cpu_times  = [row["ps_cpu_ms"] for row in performance_log]
+        total_cycles  = [row["hardware_cycles"] for row in performance_log]
+        
+        mean_pure_ip     = np.mean(pure_ip_times)
+        mean_pl_roundtrip = np.mean(pl_roundtrips)
+        mean_ps_cpu      = np.mean(ps_cpu_times)
+        mean_cycles       = int(np.mean(total_cycles))
+        
+        print("\n=== FINAL BENCHMARK SUMMARY ===")
+        print(f"Total Frames Processed : {len(performance_log)}")
+        print(f"Mean Pure IP Latency   : {mean_pure_ip:.3f} ms")
+        print(f"Mean PL Round-Trip Time: {mean_pl_roundtrip:.3f} ms")
+        print(f"Mean PS (CPU) Latency  : {mean_ps_cpu:.3f} ms")
+        print(f"Mean Hardware Cycles   : {mean_cycles:,} cycles")
+        print("===============================\n")
+        
+        # Write out to the CSV file
+        csv_filename = "harris_performance_log.csv"
+        csv_headers = performance_log[0].keys()
+        
+        try:
+            with open(csv_filename, mode='w', newline='') as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
+                writer.writeheader()
+                writer.writerows(performance_log)
+            print(f"Successfully saved all metrics to '{csv_filename}'.")
+        except Exception as e:
+            print(f"Error saving CSV file: {e}")
+    else:
+        print("No frame data recorded to generate means or CSV.")
+
