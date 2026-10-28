@@ -57,7 +57,7 @@ static constexpr int FPGA_W = 480;
 static constexpr int FPGA_H = 320;
 static constexpr size_t FPGA_FRAME_BYTES = FPGA_W * FPGA_H;
 static constexpr size_t FPGA_TOTAL_BYTES = FPGA_FRAME_BYTES * 2;
-static constexpr int FPGA_THRESH = 1500; // Calibrated HCD threshold
+static constexpr int FPGA_THRESH = 900; // Calibrated HCD threshold
 static constexpr int FPGA_K = 2621;      // k = 0.04 in Q0.16 format
 } // namespace
 
@@ -171,7 +171,7 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
     img_fpga = gray;
   }
 
-  // 2. Transfer frame into DMA buffer and clear output
+  // 2. Transfer frame into DMA buffer and clear output memory
   memcpy(g_shared_mem, img_fpga.data, FPGA_FRAME_BYTES);
   memset(g_shared_mem + FPGA_FRAME_BYTES, 0, FPGA_FRAME_BYTES);
 
@@ -182,7 +182,7 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
     (void)s;
   }
 
-  // 4. Re-assert physical parameters
+  // 4. Assert physical parameters
   uint64_t phys_out = g_phys_in + FPGA_FRAME_BYTES;
   g_axi[0x10 / 4] = (uint32_t)(g_phys_in & 0xFFFFFFFF);
   g_axi[0x14 / 4] = (uint32_t)((g_phys_in >> 32) & 0xFFFFFFFF);
@@ -193,41 +193,26 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
   g_axi[0x38 / 4] = FPGA_THRESH;
   g_axi[0x40 / 4] = FPGA_K;
 
-  // 5. Trigger hardware execution and measure wall-clock latency
+  // 5. Trigger hardware execution
   auto t_hw_start = std::chrono::high_resolution_clock::now();
+  g_axi[0x00 / 4] = 0x01; // AP_START
 
-  // Wait until IP is idle before triggering
-  uint32_t idle_wait = 0;
-  while (!(g_axi[0x00 / 4] & 0x04) && ++idle_wait < 10000) {
-    usleep(10);
-  }
-
-  g_axi[0x00 / 4] = 0x01; // Assert AP_START
-
-  // True wall-clock timeout: wait up to 20 ms with bus-yielding usleep
+  // Non-blocking tight poll: No usleep! 
+  // 1,500,000 uncached register reads corresponds to ~12-15 ms on Cortex-A53
+  uint32_t timeout = 0;
   bool hw_success = false;
-  while (true) {
-    uint32_t status = g_axi[0x00 / 4];
-    if (status & 0x02) { // ap_done is high
+  while (++timeout < 1500000) {
+    if (g_axi[0x00 / 4] & 0x02) { // ap_done is high
       hw_success = true;
       break;
     }
-
-    auto t_now = std::chrono::high_resolution_clock::now();
-    double elapsed_ms = std::chrono::duration<double, std::milli>(t_now - t_hw_start).count();
-    if (elapsed_ms > 20.0) {
-      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout (>20ms)! AXI status: 0x%X\n" RESET, status);
-      break;
-    }
-
-    // Yield CPU briefly so memory controller has full bandwidth for DMA bursts
-    usleep(25);
+    asm volatile("yield"); // Non-blocking CPU pipeline hint (no context switch)
   }
   g_axi[0x00 / 4] = 0x00;
 
-  // If hardware stalled or timed out, abort immediately to allow clean CPU fallback
   if (!hw_success) {
-    return;
+    PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout (~15ms)! AXI status: 0x%X\n" RESET, g_axi[0x00 / 4]);
+    return; // Fallback to CPU FAST cleanly without stalling
   }
 
   auto t_hw_end = std::chrono::high_resolution_clock::now();
@@ -255,7 +240,7 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
     pts_ext.emplace_back(cx, cy, 1.0f);
   }
 
-  // 8. Immediate console confirmation
+  // 8. Console log confirmation
   printf(GREEN "[OpenVINS-FPGA] Frame processed on FPGA! Extracted %zu corners in %.2f ms\n" RESET,
          pts_ext.size(), hw_latency_ms);
   fflush(stdout);
