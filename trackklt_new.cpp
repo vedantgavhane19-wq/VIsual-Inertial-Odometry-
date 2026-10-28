@@ -20,7 +20,6 @@
  */
 
 #include "TrackKLT.h"
-#include "HcdAccelerator.hpp"
 
 #include <chrono>
 #include <fcntl.h>
@@ -28,6 +27,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <string.h>
+#include <mutex>
 
 #include "Grider_FAST.h"
 #include "Grider_GRID.h"
@@ -38,6 +38,28 @@
 #include "utils/print.h"
 
 using namespace ov_core;
+
+// =========================================================================
+// Encapsulated FPGA Hardware State (Internal to TrackKLT.cpp)
+// =========================================================================
+namespace {
+static bool g_fpga_ready = false;
+static int g_mem_fd = -1;
+static int g_udma_fd = -1;
+static int g_sync_dev = -1;
+static int g_sync_cpu = -1;
+static uint8_t *g_shared_mem = nullptr;
+static volatile uint32_t *g_axi = nullptr;
+static uint64_t g_phys_in = 0;
+static std::mutex g_fpga_mutex;
+
+static constexpr int FPGA_W = 480;
+static constexpr int FPGA_H = 320;
+static constexpr size_t FPGA_FRAME_BYTES = FPGA_W * FPGA_H;
+static constexpr size_t FPGA_TOTAL_BYTES = FPGA_FRAME_BYTES * 2;
+static constexpr int FPGA_THRESH = 1500; // Calibrated HCD threshold
+static constexpr int FPGA_K = 2621;      // k = 0.04 in Q0.16 format
+} // namespace
 
 TrackKLT::TrackKLT(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco, bool stereo,
                    HistogramMethod histmethod, int fast_threshold, int gridx, int gridy, int minpxdist)
@@ -51,36 +73,172 @@ TrackKLT::~TrackKLT() {
 }
 
 void TrackKLT::init_fpga() {
-  if (!HcdAccelerator::getInstance().isInitialized()) {
-    PRINT_WARNING(YELLOW "[OpenVINS-FPGA] Warning: Failed to initialize FPGA accelerator. Falling back to CPU FAST.\n" RESET);
-  } else {
-    PRINT_INFO(GREEN "[OpenVINS-FPGA] Harris Corner Detector Accelerator ready!\n" RESET);
+  std::lock_guard<std::mutex> lock(g_fpga_mutex);
+  if (g_fpga_ready) return;
+
+  // 1. Read physical address dynamically from udmabuf0 sysfs
+  FILE *f_addr = fopen("/sys/class/u-dma-buf/udmabuf0/phys_addr", "r");
+  if (!f_addr || fscanf(f_addr, "%lx", &g_phys_in) != 1) {
+    PRINT_WARNING(YELLOW "[OpenVINS-FPGA] Cannot read udmabuf0 phys_addr. CPU fallback active.\n" RESET);
+    if (f_addr) fclose(f_addr);
+    return;
   }
+  fclose(f_addr);
+
+  // 2. Configure u-dma-buf cache sync parameters (CRITICAL: prevents syncing 0 bytes)
+  FILE *f_sz = fopen("/sys/class/u-dma-buf/udmabuf0/sync_size", "w");
+  if (f_sz) { fprintf(f_sz, "%zu\n", FPGA_TOTAL_BYTES); fclose(f_sz); }
+  FILE *f_dir = fopen("/sys/class/u-dma-buf/udmabuf0/sync_direction", "w");
+  if (f_dir) { fprintf(f_dir, "3\n"); fclose(f_dir); } // 3 = DMA_BIDIRECTIONAL
+  FILE *f_off = fopen("/sys/class/u-dma-buf/udmabuf0/sync_offset", "w");
+  if (f_off) { fprintf(f_off, "0\n"); fclose(f_off); }
+
+  // 3. Open udmabuf0 for DMA memory
+  g_udma_fd = open("/dev/udmabuf0", O_RDWR);
+  if (g_udma_fd < 0) {
+    PRINT_WARNING(YELLOW "[OpenVINS-FPGA] Failed to open /dev/udmabuf0. CPU fallback active.\n" RESET);
+    return;
+  }
+  g_shared_mem = (uint8_t *)mmap(NULL, FPGA_TOTAL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, g_udma_fd, 0);
+  if (g_shared_mem == MAP_FAILED) {
+    close(g_udma_fd); g_udma_fd = -1; g_shared_mem = nullptr;
+    return;
+  }
+
+  // 4. Open /dev/mem for AXI control registers
+  g_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+  if (g_mem_fd < 0) {
+    PRINT_WARNING(YELLOW "[OpenVINS-FPGA] Failed to open /dev/mem (run with sudo). CPU fallback active.\n" RESET);
+    munmap(g_shared_mem, FPGA_TOTAL_BYTES); g_shared_mem = nullptr;
+    close(g_udma_fd); g_udma_fd = -1;
+    return;
+  }
+  g_axi = (volatile uint32_t *)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, g_mem_fd, 0xB0000000);
+  if (g_axi == MAP_FAILED) {
+    close(g_mem_fd); g_mem_fd = -1; g_axi = nullptr;
+    munmap(g_shared_mem, FPGA_TOTAL_BYTES); g_shared_mem = nullptr;
+    close(g_udma_fd); g_udma_fd = -1;
+    return;
+  }
+
+  g_sync_dev = open("/sys/class/u-dma-buf/udmabuf0/sync_for_device", O_WRONLY);
+  g_sync_cpu = open("/sys/class/u-dma-buf/udmabuf0/sync_for_cpu", O_WRONLY);
+
+  // 5. Initial AXI Configuration
+  uint64_t phys_out = g_phys_in + FPGA_FRAME_BYTES;
+  g_axi[0x10 / 4] = (uint32_t)(g_phys_in & 0xFFFFFFFF);
+  g_axi[0x14 / 4] = (uint32_t)((g_phys_in >> 32) & 0xFFFFFFFF);
+  g_axi[0x1C / 4] = (uint32_t)(phys_out & 0xFFFFFFFF);
+  g_axi[0x20 / 4] = (uint32_t)((phys_out >> 32) & 0xFFFFFFFF);
+  g_axi[0x28 / 4] = FPGA_H;
+  g_axi[0x30 / 4] = FPGA_W;
+  g_axi[0x38 / 4] = FPGA_THRESH;
+  g_axi[0x40 / 4] = FPGA_K;
+
+  g_fpga_ready = true;
+  PRINT_INFO(GREEN "[OpenVINS-FPGA] Harris Corner Detector Accelerator ready at 0xB0000000!\n" RESET);
 }
 
 void TrackKLT::close_fpga() {
-  // Device node closure and unmapping are handled automatically by the HcdAccelerator singleton destructor
+  std::lock_guard<std::mutex> lock(g_fpga_mutex);
+  if (g_sync_dev >= 0) { close(g_sync_dev); g_sync_dev = -1; }
+  if (g_sync_cpu >= 0) { close(g_sync_cpu); g_sync_cpu = -1; }
+  if (g_axi && g_axi != MAP_FAILED) { munmap((void *)g_axi, 0x10000); g_axi = nullptr; }
+  if (g_mem_fd >= 0) { close(g_mem_fd); g_mem_fd = -1; }
+  if (g_shared_mem && g_shared_mem != MAP_FAILED) { munmap(g_shared_mem, FPGA_TOTAL_BYTES); g_shared_mem = nullptr; }
+  if (g_udma_fd >= 0) { close(g_udma_fd); g_udma_fd = -1; }
+  g_fpga_ready = false;
 }
 
 void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ext) {
-  HcdAccelerator::getInstance().detect(img, pts_ext);
+  pts_ext.clear();
+  if (!g_fpga_ready || img.empty()) return;
+
+  std::lock_guard<std::mutex> lock(g_fpga_mutex);
+
+  // 1. Convert to grayscale and resize to FPGA resolution (480x320)
+  cv::Mat gray;
+  if (img.channels() == 3) {
+    cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+  } else {
+    gray = img;
+  }
+
+  cv::Mat img_fpga;
+  if (gray.cols != FPGA_W || gray.rows != FPGA_H) {
+    cv::resize(gray, img_fpga, cv::Size(FPGA_W, FPGA_H));
+  } else {
+    img_fpga = gray;
+  }
+
+  // 2. Transfer frame into DMA buffer and clear output
+  memcpy(g_shared_mem, img_fpga.data, FPGA_FRAME_BYTES);
+  memset(g_shared_mem + FPGA_FRAME_BYTES, 0, FPGA_FRAME_BYTES);
+
+  // 3. Flush CPU cache to DDR for FPGA
+  if (g_sync_dev >= 0) {
+    lseek(g_sync_dev, 0, SEEK_SET);
+    ssize_t s = write(g_sync_dev, "1", 1);
+    (void)s;
+  }
+
+  // 4. Re-assert physical parameters
+  uint64_t phys_out = g_phys_in + FPGA_FRAME_BYTES;
+  g_axi[0x10 / 4] = (uint32_t)(g_phys_in & 0xFFFFFFFF);
+  g_axi[0x14 / 4] = (uint32_t)((g_phys_in >> 32) & 0xFFFFFFFF);
+  g_axi[0x1C / 4] = (uint32_t)(phys_out & 0xFFFFFFFF);
+  g_axi[0x20 / 4] = (uint32_t)((phys_out >> 32) & 0xFFFFFFFF);
+  g_axi[0x28 / 4] = FPGA_H;
+  g_axi[0x30 / 4] = FPGA_W;
+  g_axi[0x38 / 4] = FPGA_THRESH;
+  g_axi[0x40 / 4] = FPGA_K;
+
+  // 5. Trigger hardware execution
+  g_axi[0x00 / 4] = 0x01; // AP_START
+
+  // Busy-wait polling
+  uint32_t timeout = 0;
+  while (!(g_axi[0x00 / 4] & 0x02)) {
+    if (++timeout > 50000000) {
+      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout! Hardware deadlocked. CTRL: 0x%X\n" RESET, g_axi[0x00 / 4]);
+      g_axi[0x00 / 4] = 0x00;
+      return;
+    }
+  }
+  g_axi[0x00 / 4] = 0x00;
+
+  // 6. Invalidate CPU cache to read FPGA results from DDR
+  if (g_sync_cpu >= 0) {
+    lseek(g_sync_cpu, 0, SEEK_SET);
+    ssize_t s = write(g_sync_cpu, "1", 1);
+    (void)s;
+  }
+
+  // 7. Centroid extraction via connected components
+  cv::Mat mask_fpga(FPGA_H, FPGA_W, CV_8UC1, g_shared_mem + FPGA_FRAME_BYTES);
+  cv::Mat binary_mask = (mask_fpga > 0);
+  cv::Mat labels, stats, centroids;
+  int n_labels = cv::connectedComponentsWithStats(binary_mask, labels, stats, centroids, 8);
+
+  float scale_u = static_cast<float>(img.cols) / static_cast<float>(FPGA_W);
+  float scale_v = static_cast<float>(img.rows) / static_cast<float>(FPGA_H);
+
+  for (int i = 1; i < n_labels && i <= 800; i++) {
+    float cx = static_cast<float>(centroids.at<double>(i, 0)) * scale_u;
+    float cy = static_cast<float>(centroids.at<double>(i, 1)) * scale_v;
+    pts_ext.emplace_back(cx, cy, 1.0f);
+  }
 }
 
 void TrackKLT::feed_new_camera(const CameraData &message) {
-
-  // Error check that we have all the data
   if (message.sensor_ids.empty() || message.sensor_ids.size() != message.images.size() || message.images.size() != message.masks.size()) {
     PRINT_ERROR(RED "[ERROR]: MESSAGE DATA SIZES DO NOT MATCH OR EMPTY!!!\n" RESET);
-    PRINT_ERROR(RED "[ERROR]:   - message.sensor_ids.size() = %zu\n" RESET, message.sensor_ids.size());
-    PRINT_ERROR(RED "[ERROR]:   - message.images.size() = %zu\n" RESET, message.images.size());
-    PRINT_ERROR(RED "[ERROR]:   - message.masks.size() = %zu\n" RESET, message.masks.size());
     std::exit(EXIT_FAILURE);
   }
 
   rT1 = boost::posix_time::microsec_clock::local_time();
   size_t num_images = message.images.size();
   for (size_t msg_id = 0; msg_id < num_images; msg_id++) {
-
     size_t cam_id = message.sensor_ids.at(msg_id);
     std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
 
@@ -109,18 +267,17 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
     feed_stereo(message, 0, 1);
   } else if (!use_stereo) {
     parallel_for_(cv::Range(0, (int)num_images), LambdaBody([&](const cv::Range &range) {
-                    for (int i = range.start; i < range.end; i++) {
-                      feed_monocular(message, i);
-                    }
-                  }));
+      for (int i = range.start; i < range.end; i++) {
+        feed_monocular(message, i);
+      }
+    }));
   } else {
-    PRINT_ERROR(RED "[ERROR]: invalid number of images passed %zu, we only support mono or stereo tracking", num_images);
+    PRINT_ERROR(RED "[ERROR]: invalid number of images passed %zu\n", num_images);
     std::exit(EXIT_FAILURE);
   }
 }
 
 void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
-
   size_t cam_id = message.sensor_ids.at(msg_id);
   std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
 
@@ -174,10 +331,8 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x >= img.cols ||
         (int)pts_left_new.at(i).pt.y >= img.rows)
       continue;
-
     if ((int)message.masks.at(msg_id).at<uint8_t>((int)pts_left_new.at(i).pt.y, (int)pts_left_new.at(i).pt.x) > 127)
       continue;
-
     if (mask_ll[i]) {
       good_left.push_back(pts_left_new[i]);
       good_ids_left.push_back(ids_left_old[i]);
@@ -209,7 +364,6 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
 }
 
 void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t msg_id_right) {
-
   size_t cam_id_left = message.sensor_ids.at(msg_id_left);
   size_t cam_id_right = message.sensor_ids.at(msg_id_right);
   std::lock_guard<std::mutex> lck1(mtx_feeds.at(cam_id_left));
@@ -258,14 +412,14 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   std::vector<cv::KeyPoint> pts_right_new = pts_right_old;
 
   parallel_for_(cv::Range(0, 2), LambdaBody([&](const cv::Range &range) {
-                  for (int i = range.start; i < range.end; i++) {
-                    bool is_left = (i == 0);
-                    perform_matching(img_pyramid_last[is_left ? cam_id_left : cam_id_right], is_left ? imgpyr_left : imgpyr_right,
-                                     is_left ? pts_left_old : pts_right_old, is_left ? pts_left_new : pts_right_new,
-                                     is_left ? cam_id_left : cam_id_right, is_left ? cam_id_left : cam_id_right,
-                                     is_left ? mask_ll : mask_rr);
-                  }
-                }));
+    for (int i = range.start; i < range.end; i++) {
+      bool is_left = (i == 0);
+      perform_matching(img_pyramid_last[is_left ? cam_id_left : cam_id_right], is_left ? imgpyr_left : imgpyr_right,
+                       is_left ? pts_left_old : pts_right_old, is_left ? pts_left_new : pts_right_new,
+                       is_left ? cam_id_left : cam_id_right, is_left ? cam_id_left : cam_id_right,
+                       is_left ? mask_ll : mask_rr);
+    }
+  }));
   rT4 = boost::posix_time::microsec_clock::local_time();
   rT5 = boost::posix_time::microsec_clock::local_time();
 
@@ -292,7 +446,6 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x > img_left.cols ||
         (int)pts_left_new.at(i).pt.y > img_left.rows)
       continue;
-
     bool found_right = false;
     size_t index_right = 0;
     for (size_t n = 0; n < ids_right_old.size(); n++) {
@@ -302,7 +455,6 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         break;
       }
     }
-
     if (mask_ll[i] && found_right && mask_rr[index_right]) {
       if (pts_right_new.at(index_right).pt.x < 0 || pts_right_new.at(index_right).pt.y < 0 ||
           (int)pts_right_new.at(index_right).pt.x >= img_right.cols || (int)pts_right_new.at(index_right).pt.y >= img_right.rows)
@@ -321,7 +473,6 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     if (pts_right_new.at(i).pt.x < 0 || pts_right_new.at(i).pt.y < 0 || (int)pts_right_new.at(i).pt.x >= img_right.cols ||
         (int)pts_right_new.at(i).pt.y >= img_right.rows)
       continue;
-
     bool added_already = (std::find(good_ids_right.begin(), good_ids_right.end(), ids_right_old.at(i)) != good_ids_right.end());
     if (mask_rr[i] && !added_already) {
       good_right.push_back(pts_right_new[i]);
@@ -331,13 +482,11 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
 
   for (size_t i = 0; i < good_left.size(); i++) {
     cv::Point2f npt_l = camera_calib.at(cam_id_left)->undistort_cv(good_left.at(i).pt);
-    database->update_feature(good_ids_left.at(i), message.timestamp, cam_id_left, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x,
-                             npt_l.y);
+    database->update_feature(good_ids_left.at(i), message.timestamp, cam_id_left, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x, npt_l.y);
   }
   for (size_t i = 0; i < good_right.size(); i++) {
     cv::Point2f npt_r = camera_calib.at(cam_id_right)->undistort_cv(good_right.at(i).pt);
-    database->update_feature(good_ids_right.at(i), message.timestamp, cam_id_right, good_right.at(i).pt.x, good_right.at(i).pt.y, npt_r.x,
-                             npt_r.y);
+    database->update_feature(good_ids_right.at(i), message.timestamp, cam_id_right, good_right.at(i).pt.x, good_right.at(i).pt.y, npt_r.x, npt_r.y);
   }
 
   {
@@ -389,7 +538,6 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
       it1 = ids0.erase(it1);
       continue;
     }
-
     int x_close = (int)(kpt.pt.x / (float)min_px_dist);
     int y_close = (int)(kpt.pt.y / (float)min_px_dist);
     if (x_close < 0 || x_close >= size_close.width || y_close < 0 || y_close >= size_close.height) {
@@ -397,7 +545,6 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
       it1 = ids0.erase(it1);
       continue;
     }
-
     int x_grid = std::floor(kpt.pt.x / size_x);
     int y_grid = std::floor(kpt.pt.y / size_y);
     if (x_grid < 0 || x_grid >= size_grid.width || y_grid < 0 || y_grid >= size_grid.height) {
@@ -405,24 +552,20 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
       it1 = ids0.erase(it1);
       continue;
     }
-
     if (grid_2d_close.at<uint8_t>(y_close, x_close) > 127) {
       it0 = pts0.erase(it0);
       it1 = ids0.erase(it1);
       continue;
     }
-
     if (mask0.at<uint8_t>(y, x) > 127) {
       it0 = pts0.erase(it0);
       it1 = ids0.erase(it1);
       continue;
     }
-
     grid_2d_close.at<uint8_t>(y_close, x_close) = 255;
     if (grid_2d_grid.at<uint8_t>(y_grid, x_grid) < 255) {
       grid_2d_grid.at<uint8_t>(y_grid, x_grid) += 1;
     }
-
     if (x - min_px_dist >= 0 && x + min_px_dist < img0pyr.at(0).cols && y - min_px_dist >= 0 && y + min_px_dist < img0pyr.at(0).rows) {
       cv::Point pt1(x - min_px_dist, y - min_px_dist);
       cv::Point pt2(x + min_px_dist, y + min_px_dist);
@@ -437,7 +580,6 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   if (num_featsneeded < std::min(20, (int)(min_feat_percent * num_features)))
     return;
 
-  // Grid mask calculation for fallback
   cv::Mat mask0_grid;
   cv::resize(mask0, mask0_grid, size_grid, 0.0, 0.0, cv::INTER_NEAREST);
   int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
@@ -451,17 +593,12 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     }
   }
 
-  // --- FEATURE EXTRACTION (FPGA ACCELERATED WITH CPU FALLBACK) ---
+  // --- HARDWARE ACCELERATED EXTRACTION WITH CPU FALLBACK ---
   std::vector<cv::KeyPoint> pts0_ext;
-  if (HcdAccelerator::getInstance().isInitialized()) {
-    detect_fpga(img0pyr.at(0), pts0_ext);
-    if (pts0_ext.size() < 20) {
-      PRINT_WARNING(YELLOW "[FPGA] Insufficient points (%zu), using CPU FAST for this frame.\n" RESET, pts0_ext.size());
-      pts0_ext.clear();
-      Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext,
-                                   num_features, grid_x, grid_y, threshold, true);
-    }
-  } else {
+  detect_fpga(img0pyr.at(0), pts0_ext);
+
+  if (pts0_ext.size() < 20) {
+    pts0_ext.clear();
     Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext,
                                  num_features, grid_x, grid_y, threshold, true);
   }
@@ -474,7 +611,6 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
     if (x_grid < 0 || x_grid >= size_close.width || y_grid < 0 || y_grid >= size_close.height)
       continue;
-
     if (grid_2d_close.at<uint8_t>(y_grid, x_grid) > 127)
       continue;
 
@@ -498,7 +634,6 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   for (size_t i = 0; i < pts0_new.size(); i++) {
     if ((int)pts0.size() >= num_features)
       break;
-
     kpts0_new.at(i).pt = pts0_new.at(i);
     pts0.push_back(kpts0_new.at(i));
     size_t temp = ++currid;
@@ -531,7 +666,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       it1 = ids0.erase(it1);
       continue;
     }
-
     int x_close = (int)(kpt.pt.x / (float)min_px_dist);
     int y_close = (int)(kpt.pt.y / (float)min_px_dist);
     if (x_close < 0 || x_close >= size_close0.width || y_close < 0 || y_close >= size_close0.height) {
@@ -539,7 +673,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       it1 = ids0.erase(it1);
       continue;
     }
-
     int x_grid = std::floor(kpt.pt.x / size_x0);
     int y_grid = std::floor(kpt.pt.y / size_y0);
     if (x_grid < 0 || x_grid >= size_grid0.width || y_grid < 0 || y_grid >= size_grid0.height) {
@@ -547,24 +680,20 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       it1 = ids0.erase(it1);
       continue;
     }
-
     if (grid_2d_close0.at<uint8_t>(y_close, x_close) > 127) {
       it0 = pts0.erase(it0);
       it1 = ids0.erase(it1);
       continue;
     }
-
     if (mask0.at<uint8_t>(y, x) > 127) {
       it0 = pts0.erase(it0);
       it1 = ids0.erase(it1);
       continue;
     }
-
     grid_2d_close0.at<uint8_t>(y_close, x_close) = 255;
     if (grid_2d_grid0.at<uint8_t>(y_grid, x_grid) < 255) {
       grid_2d_grid0.at<uint8_t>(y_grid, x_grid) += 1;
     }
-
     if (x - min_px_dist >= 0 && x + min_px_dist < img0pyr.at(0).cols && y - min_px_dist >= 0 && y + min_px_dist < img0pyr.at(0).rows) {
       cv::Point pt1(x - min_px_dist, y - min_px_dist);
       cv::Point pt2(x + min_px_dist, y + min_px_dist);
@@ -578,7 +707,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
   int num_featsneeded_0 = num_features - (int)pts0.size();
 
   if (num_featsneeded_0 > std::min(20, (int)(min_feat_percent * num_features))) {
-
     cv::Mat mask0_grid;
     cv::resize(mask0, mask0_grid, size_grid0, 0.0, 0.0, cv::INTER_NEAREST);
     int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
@@ -593,9 +721,9 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
     }
 
     std::vector<cv::KeyPoint> pts0_ext;
-    if (fpga_initialized) {
-      detect_fpga(img0pyr.at(0), pts0_ext);
-    } else {
+    detect_fpga(img0pyr.at(0), pts0_ext);
+    if (pts0_ext.size() < 20) {
+      pts0_ext.clear();
       Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext, num_features, grid_x, grid_y, threshold, true);
     }
 
@@ -606,10 +734,8 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
       if (x_grid < 0 || x_grid >= size_close0.width || y_grid < 0 || y_grid >= size_close0.height)
         continue;
-
       if (grid_2d_close0.at<uint8_t>(y_grid, x_grid) > 127)
         continue;
-
       grid_2d_close0.at<uint8_t>(y_grid, x_grid) = 255;
       kpts0_new.push_back(kpt);
       pts0_new.push_back(kpt.pt);
@@ -628,7 +754,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       for (size_t i = 0; i < pts0_new.size(); i++) {
         if ((int)pts0.size() >= num_features)
           break;
-
         bool oob_left = ((int)pts0_new.at(i).x < 0 || (int)pts0_new.at(i).x >= img0pyr.at(0).cols || (int)pts0_new.at(i).y < 0 ||
                          (int)pts0_new.at(i).y >= img0pyr.at(0).rows);
         bool oob_right = ((int)pts1_new.at(i).x < 0 || (int)pts1_new.at(i).x >= img1pyr.at(0).cols || (int)pts1_new.at(i).y < 0 ||
@@ -652,7 +777,7 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
     }
   }
 
-  // Right camera extraction
+  // Right camera feature extraction
   cv::Size size_close1((int)((float)img1pyr.at(0).cols / (float)min_px_dist), (int)((float)img1pyr.at(0).rows / (float)min_px_dist));
   cv::Mat grid_2d_close1 = cv::Mat::zeros(size_close1, CV_8UC1);
   float size_x1 = (float)img1pyr.at(0).cols / (float)grid_x;
@@ -673,7 +798,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       it1 = ids1.erase(it1);
       continue;
     }
-
     int x_close = (int)(kpt.pt.x / (float)min_px_dist);
     int y_close = (int)(kpt.pt.y / (float)min_px_dist);
     if (x_close < 0 || x_close >= size_close1.width || y_close < 0 || y_close >= size_close1.height) {
@@ -681,7 +805,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       it1 = ids1.erase(it1);
       continue;
     }
-
     int x_grid = std::floor(kpt.pt.x / size_x1);
     int y_grid = std::floor(kpt.pt.y / size_y1);
     if (x_grid < 0 || x_grid >= size_grid1.width || y_grid < 0 || y_grid >= size_grid1.height) {
@@ -689,25 +812,21 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       it1 = ids1.erase(it1);
       continue;
     }
-
     bool is_stereo = (std::find(ids0.begin(), ids0.end(), *it1) != ids0.end());
     if (grid_2d_close1.at<uint8_t>(y_close, x_close) > 127 && !is_stereo) {
       it0 = pts1.erase(it0);
       it1 = ids1.erase(it1);
       continue;
     }
-
     if (mask1.at<uint8_t>(y, x) > 127) {
       it0 = pts1.erase(it0);
       it1 = ids1.erase(it1);
       continue;
     }
-
     grid_2d_close1.at<uint8_t>(y_close, x_close) = 255;
     if (grid_2d_grid1.at<uint8_t>(y_grid, x_grid) < 255) {
       grid_2d_grid1.at<uint8_t>(y_grid, x_grid) += 1;
     }
-
     if (x - min_px_dist >= 0 && x + min_px_dist < img1pyr.at(0).cols && y - min_px_dist >= 0 && y + min_px_dist < img1pyr.at(0).rows) {
       cv::Point pt1(x - min_px_dist, y - min_px_dist);
       cv::Point pt2(x + min_px_dist, y + min_px_dist);
@@ -719,7 +838,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
 
   int num_featsneeded_1 = num_features - (int)pts1.size();
   if (num_featsneeded_1 > std::min(20, (int)(min_feat_percent * num_features))) {
-
     cv::Mat mask1_grid;
     cv::resize(mask1, mask1_grid, size_grid1, 0.0, 0.0, cv::INTER_NEAREST);
     int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
@@ -734,21 +852,19 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
     }
 
     std::vector<cv::KeyPoint> pts1_ext;
-    if (fpga_initialized) {
-      detect_fpga(img1pyr.at(0), pts1_ext);
-    } else {
+    detect_fpga(img1pyr.at(0), pts1_ext);
+    if (pts1_ext.size() < 20) {
+      pts1_ext.clear();
       Grider_GRID::perform_griding(img1pyr.at(0), mask1_updated, valid_locs, pts1_ext, num_features, grid_x, grid_y, threshold, true);
     }
 
     for (auto &kpt : pts1_ext) {
       if ((int)pts1.size() >= num_features)
         break;
-
       int x_grid = (int)(kpt.pt.x / (float)min_px_dist);
       int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
       if (x_grid < 0 || x_grid >= size_close1.width || y_grid < 0 || y_grid >= size_close1.height)
         continue;
-
       if (grid_2d_close1.at<uint8_t>(y_grid, x_grid) > 127)
         continue;
 
@@ -762,7 +878,6 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
 
 void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
                                 std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out) {
-
   assert(kpts0.size() == kpts1.size());
   if (kpts0.empty() || kpts1.empty())
     return;
