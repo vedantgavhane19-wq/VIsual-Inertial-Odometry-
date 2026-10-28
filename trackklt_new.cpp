@@ -193,19 +193,17 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
   g_axi[0x38 / 4] = FPGA_THRESH;
   g_axi[0x40 / 4] = FPGA_K;
 
-  // 5. Trigger hardware execution
+// 5. Trigger hardware execution
   g_axi[0x00 / 4] = 0x01; // AP_START
 
-  // Busy-wait polling
+  // Fast busy-wait polling (~1 ms execution, cap timeout at ~15 ms)
   uint32_t timeout = 0;
   while (!(g_axi[0x00 / 4] & 0x02)) {
-    if (++timeout > 50000000) {
-      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout! Hardware deadlocked. CTRL: 0x%X\n" RESET, g_axi[0x00 / 4]);
-      g_axi[0x00 / 4] = 0x00;
-      return;
+    if (++timeout > 100000) { // 100,000 iterations is ~15ms (never blocks for 15 seconds!)
+      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout (~15ms)! AXI status: 0x%X\n" RESET, g_axi[0x00 / 4]);
+      break;
     }
   }
-  g_axi[0x00 / 4] = 0x00;
 
   // 6. Invalidate CPU cache to read FPGA results from DDR
   if (g_sync_cpu >= 0) {
