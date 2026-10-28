@@ -622,3 +622,26 @@ private:
 };
 
 } // namespace ov_core
+
+
+
+-------------------------------------------------------TrackKLT.cpp-------------------------------------------------------------------------------------------------
+
+// 5. Trigger hardware execution
+  g_axi[0x00 / 4] = 0x01; // AP_START
+
+  // Fast busy-wait polling (~1 ms execution, cap timeout at ~15 ms)
+  uint32_t timeout = 0;
+  while (!(g_axi[0x00 / 4] & 0x02)) {
+    if (++timeout > 100000) { // 100,000 iterations is ~15ms (never blocks for 15 seconds!)
+      PRINT_ERROR(RED "[OpenVINS-FPGA] Timeout (~15ms)! AXI status: 0x%X\n" RESET, g_axi[0x00 / 4]);
+      break;
+    }
+  }
+
+  // 6. Invalidate CPU cache to read FPGA results from DDR
+  if (g_sync_cpu >= 0) {
+    lseek(g_sync_cpu, 0, SEEK_SET);
+    ssize_t s = write(g_sync_cpu, "1", 1);
+    (void)s;
+  }
