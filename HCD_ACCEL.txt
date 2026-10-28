@@ -222,6 +222,22 @@ localparam integer ADDR_LSB = 2; // (32-bit = 4 bytes per word, so LSB is 2)
 
 
 
+----------------------------------------------------Verifying the 16-Byte Register Boundaries------------------------------------------------
+
+# 1. Write unique test words to each 16-byte boundary
+sudo busybox devmem 0xB0000010 32 0xAAAAAAAA
+sudo busybox devmem 0xB0000020 32 0xBBBBBBBB
+sudo busybox devmem 0xB0000030 32 0xCCCCCCCC
+sudo busybox devmem 0xB0000040 32 0xDDDDDDDD
+
+# 2. Read them back
+for a in 0x00 0x10 0x20 0x30 0x40; do
+  printf "Offset 0x%02X -> " $a
+  sudo busybox devmem $((0xB0000000 + a)) 32
+done
+
+--------------------------------------------------------------------------------------------------------------------------------------------
+
 
 --------------------------------------------load bitstream in vivado --------------------------------------------------------
 
