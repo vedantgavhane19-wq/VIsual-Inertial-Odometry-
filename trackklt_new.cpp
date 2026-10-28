@@ -194,6 +194,7 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
   g_axi[0x40 / 4] = FPGA_K;
 
 // 5. Trigger hardware execution
+  auto t_hw_start = std::chrono::high_resolution_clock::now();
   g_axi[0x00 / 4] = 0x01; // AP_START
 
   // Fast busy-wait polling (~1 ms execution, cap timeout at ~15 ms)
@@ -226,6 +227,12 @@ void TrackKLT::detect_fpga(const cv::Mat &img, std::vector<cv::KeyPoint> &pts_ex
     float cy = static_cast<float>(centroids.at<double>(i, 1)) * scale_v;
     pts_ext.emplace_back(cx, cy, 1.0f);
   }
+}
+
+// 8. Immediate console confirmation bypassing ROS 2 launch buffering
+  printf(GREEN "[OpenVINS-FPGA] Frame processed on FPGA! Extracted %zu corners in %.2f ms\n" RESET,
+         pts_ext.size(), hw_latency_ms);
+  fflush(stdout);
 }
 
 void TrackKLT::feed_new_camera(const CameraData &message) {
