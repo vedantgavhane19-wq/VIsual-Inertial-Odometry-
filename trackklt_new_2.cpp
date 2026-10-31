@@ -937,3 +937,51 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
     kpts1.at(i).pt = pts1.at(i);
   }
 }
+
+
+
+
+
+
+
+
+
+
+  // 5. Trigger hardware execution
+  auto t_hw_start = std::chrono::steady_clock::now();
+
+  // Ensure IP is idle before asserting start (Bit 2 is ap_idle = 0x04)
+  uint32_t idle_wait = 0;
+  while (!(g_axi[0x00 / 4] & 0x04) && ++idle_wait < 50000) {
+    asm volatile("yield");
+  }
+
+  g_axi[0x00 / 4] = 0x01; // Assert AP_START
+
+  // True wall-clock timeout: 30 ms real headroom without OS thread sleep
+  bool hw_success = false;
+  while (true) {
+    uint32_t status = g_axi[0x00 / 4];
+    if (status & 0x02) { // ap_done asserted
+      hw_success = true;
+      break;
+    }
+
+    auto t_now = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_now - t_hw_start).count();
+    if (elapsed_ms > 30.0) {
+      PRINT_ERROR(RED "[OpenVINS-FPGA] Real Timeout (>30ms)! AXI status: 0x%X\n" RESET, status);
+      break;
+    }
+
+    asm volatile("yield"); // Non-blocking pipeline hint
+  }
+
+  g_axi[0x00 / 4] = 0x00; // Clear start
+
+  if (!hw_success) {
+    return; // Clean fallback to CPU FAST for this single frame
+  }
+
+  auto t_hw_end = std::chrono::steady_clock::now();
+  double hw_latency_ms = std::chrono::duration<double, std::milli>(t_hw_end - t_hw_start).count();
